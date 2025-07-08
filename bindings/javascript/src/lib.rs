@@ -132,16 +132,6 @@ impl Database {
     }
 
     #[napi]
-    pub fn readonly(&self) -> bool {
-        self.readonly
-    }
-
-    #[napi]
-    pub fn open(&self) -> bool {
-        self.open
-    }
-
-    #[napi]
     pub fn backup(&self) {
         todo!()
     }
