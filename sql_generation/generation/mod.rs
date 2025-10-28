@@ -184,16 +184,31 @@ pub fn gen_random_text<R: Rng + ?Sized>(rng: &mut R) -> String {
     }
 }
 
+/// returns an iterator over `count` unique elements from `items`.
+///
+/// # Panics
+///
+/// Panics if `items.len() < count`.
+/// Panics if the the number of distinct elements in `items` is less than `count`.
 pub fn pick_unique<'a, T: PartialEq, R: Rng + ?Sized>(
     items: &'a [T],
     count: usize,
     rng: &mut R,
 ) -> impl Iterator<Item = &'a T> {
+    if items.len() < count {
+        panic!("pick_unique cannot be called if items.len() < count");
+    }
     let mut picked: Vec<&T> = Vec::new();
+    let mut spin_count = 0;
     while picked.len() < count {
         let item = pick(items, rng);
+        spin_count += 1;
         if !picked.contains(&item) {
             picked.push(item);
+            spin_count = 0;
+        }
+        if spin_count >= 1000 {
+            panic!("could not find an unseen element in 1000 tries, it is possible pick_unique was called with a distinct `items` count less than `count`.")
         }
     }
     picked.into_iter()

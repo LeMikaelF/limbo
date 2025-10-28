@@ -1,3 +1,5 @@
+use std::cmp::min;
+
 use crate::generation::{
     gen_random_text, pick_index, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom,
     ArbitrarySized, GenerationContext,
@@ -6,7 +8,7 @@ use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTyp
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
-    SelectInner,
+    SelectInner, SelectTable,
 };
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select};
@@ -72,7 +74,7 @@ impl Arbitrary for FromClause {
                     assert_eq!(
                         row.len(),
                         table.columns.len(),
-                        "Row length does not match column length after join"
+                        "Row length does not match column length after join."
                     );
                 }
 
@@ -84,7 +86,10 @@ impl Arbitrary for FromClause {
                 })
             })
             .collect();
-        FromClause { table: name, joins }
+        FromClause {
+            table: SelectTable::Table(name),
+            joins,
+        }
     }
 }
 
@@ -101,8 +106,8 @@ impl Arbitrary for SelectInner {
                 let order_by_table_candidates = from
                     .joins
                     .iter()
-                    .map(|j| &j.table)
-                    .chain(std::iter::once(&from.table))
+                    .map(|j| j.table.clone())
+                    .chain(from.table.dependencies())
                     .collect::<Vec<_>>();
                 let order_by_col_count =
                     (rng.random::<f64>() * rng.random::<f64>() * (cuml_col_count as f64)) as usize; // skew towards 0
@@ -155,11 +160,12 @@ impl ArbitrarySized for SelectInner {
     ) -> Self {
         let mut select_inner = SelectInner::arbitrary(rng, env);
         let select_from = &select_inner.from.as_ref().unwrap();
+        //TODO why not include the select table?
         let table_names = select_from
             .joins
             .iter()
-            .map(|j| &j.table)
-            .chain(std::iter::once(&select_from.table));
+            .map(|j| j.table.clone())
+            .chain(select_from.dependencies());
 
         let flat_columns_names = table_names
             .flat_map(|t| {
@@ -172,8 +178,28 @@ impl ArbitrarySized for SelectInner {
                     .map(move |c| format!("{}.{}", t, c.name))
             })
             .collect::<Vec<_>>();
-        let selected_columns = pick_unique(&flat_columns_names, num_result_columns, rng);
+        let selected_columns = if flat_columns_names.len() >= num_result_columns {
+            pick_unique(&flat_columns_names, num_result_columns, rng).collect::<Vec<&String>>()
+        } else {
+            let mut columns = vec![];
+            while columns.len() < num_result_columns {
+                columns.extend(
+                    pick_unique(
+                        &flat_columns_names,
+                        min(
+                            flat_columns_names.iter().cloned().unique().count(),
+                            num_result_columns - columns.len(),
+                        ),
+                        rng,
+                    )
+                    .collect::<Vec<&String>>(),
+                );
+            }
+            columns
+        };
+
         let columns = selected_columns
+            .into_iter()
             .map(|col_name| ResultColumn::Column(col_name.clone()))
             .collect();
 
@@ -283,23 +309,26 @@ impl Arbitrary for Insert {
             })
         };
 
-        let _gen_select = |rng: &mut R| {
-            // Find a non-empty table
-            let select_table = env.tables().iter().find(|t| !t.rows.is_empty())?;
-            let row = pick(&select_table.rows, rng);
-            let predicate = Predicate::arbitrary_from(rng, env, (select_table, row));
-            // Pick another table to insert into
-            let select = Select::simple(select_table.name.clone(), predicate);
+        let gen_select = |rng: &mut R| {
             let table = pick(env.tables(), rng);
+            let select = Select {
+                body: SelectBody {
+                    select: Box::new(SelectInner::arbitrary_sized(rng, env, table.columns.len())),
+                    compounds: vec![],
+                },
+                limit: None,
+            };
             Some(Insert::Select {
                 table: table.name.clone(),
                 select: Box::new(select),
             })
         };
 
-        // TODO: Add back gen_select when https://github.com/tursodatabase/turso/issues/2129 is fixed.
-        // Backtrack here cannot return None
-        backtrack(vec![(1, Box::new(gen_values))], rng).unwrap()
+        backtrack(
+            vec![(1, Box::new(gen_values)), (1, Box::new(gen_select))],
+            rng,
+        )
+        .expect("backtrack should not return None here")
     }
 }
 
