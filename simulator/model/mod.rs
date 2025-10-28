@@ -407,7 +407,12 @@ impl Shadow for FromClause {
         assert!(
             join_table.rows().iter().map(|r| r.len()).unique().count() <= 1,
             "shadow rows don't all have the same length! found {:?}. Self: {self:?}",
-            join_table.rows().iter().map(|r| r.len()).unique().collect_vec()
+            join_table
+                .rows()
+                .iter()
+                .map(|r| r.len())
+                .unique()
+                .collect_vec()
         );
 
         Ok(join_table)
@@ -646,5 +651,115 @@ impl Shadow for DropIndex {
             .indexes
             .retain(|index| index.index_name != self.index_name);
         Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod from_clause_tests {
+    use sql_generation::model::{
+        query::predicate::Predicate,
+        table::{Column, ColumnType, JoinedTable},
+    };
+    use turso_parser::ast::{Expr, Name};
+
+    use super::*;
+    use crate::runner::env::ShadowTablesMut;
+
+    #[test]
+    fn test_shadow_from_clause() {
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = Option::None;
+
+        let mut tables: ShadowTablesMut = ShadowTablesMut {
+            commited_tables: &mut commited_tables,
+            transaction_tables: &mut transaction_tables,
+        };
+
+        let table1 = Table {
+            name: "table1".to_string(),
+            columns: vec![
+                ("id".to_string(), ColumnType::Integer),
+                ("value".to_string(), ColumnType::Text),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| Column {
+                name,
+                column_type,
+                constraints: vec![],
+            })
+            .collect(),
+            rows: vec![
+                vec![SimValue::int(1), SimValue::text("A".to_string())],
+                vec![SimValue::int(2), SimValue::text("B".to_string())],
+                vec![SimValue::int(4), SimValue::text("D".to_string())],
+            ],
+            indexes: vec![],
+        };
+
+        let table2 = Table {
+            name: "table2".to_string(),
+            columns: vec![
+                ("id".to_string(), ColumnType::Integer),
+                ("description".to_string(), ColumnType::Text),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| Column {
+                name,
+                column_type,
+                constraints: vec![],
+            })
+            .collect(),
+            rows: vec![
+                vec![SimValue::int(1), SimValue::text("Desc A".to_string())],
+                vec![SimValue::int(2), SimValue::text("Desc B".to_string())],
+                vec![SimValue::int(3), SimValue::text("Desc C".to_string())],
+            ],
+            indexes: vec![],
+        };
+
+        tables.push(table1);
+        tables.push(table2);
+
+        // SELECT * FROM table1 INNER JOIN table2 ON table1.id = table2.id;
+        let from_clause = FromClause {
+            table: SelectTable::Table("table1".to_string()),
+            joins: vec![JoinedTable {
+                table: "table2".to_string(),
+                join_type: JoinType::Inner,
+                on: Predicate(turso_parser::ast::Expr::Binary(
+                    Box::new(Expr::Qualified(
+                        Name::from_string("table1"),
+                        Name::from_string("id"),
+                    )),
+                    turso_parser::ast::Operator::Equals,
+                    Box::new(turso_parser::ast::Expr::Qualified(
+                        Name::from_string("table2"),
+                        Name::from_string("id"),
+                    )),
+                )),
+            }],
+        };
+
+        let result = from_clause.shadow(&mut tables).unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(
+            result.rows[0],
+            vec![
+                SimValue::int(1),
+                SimValue::text("A".to_string()),
+                SimValue::int(1),
+                SimValue::text("Desc A".to_string()),
+            ]
+        );
+        assert_eq!(
+            result.rows[1],
+            vec![
+                SimValue::int(2),
+                SimValue::text("B".to_string()),
+                SimValue::int(2),
+                SimValue::text("Desc B".to_string()),
+            ]
+        );
     }
 }

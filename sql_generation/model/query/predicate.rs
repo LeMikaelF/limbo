@@ -97,10 +97,34 @@ pub fn expr_to_value<T: TableContext>(
     row: &[SimValue],
     table: &T,
 ) -> Option<SimValue> {
+    fn get_column(col_name: &str, row: &[SimValue], table: &impl TableContext) -> Option<SimValue> {
+        let columns = table.columns().collect::<Vec<_>>();
+        assert_eq!(row.len(), columns.len());
+        let result = columns
+            .iter()
+            .zip(row.iter())
+            .find(|(column, _)| format!("{}.{}", column.table_name, column.column.name) == col_name)
+            .map(|(_, value)| value)
+            .cloned();
+        result
+    }
     match expr {
-        ast::Expr::DoublyQualified(_, _, col_name)
-        | ast::Expr::Qualified(_, col_name)
-        | ast::Expr::Id(col_name) => {
+        ast::Expr::DoublyQualified(schema_name, table_name, col_name) => get_column(
+            &format!(
+                "{}.{}.{}",
+                schema_name.as_str(),
+                table_name.as_str(),
+                col_name.as_str()
+            ),
+            row,
+            table,
+        ),
+        ast::Expr::Qualified(table_name, col_name) => get_column(
+            &format!("{}.{}", table_name.as_str(), col_name.as_str()),
+            row,
+            table,
+        ),
+        ast::Expr::Id(col_name) => {
             let columns = table.columns().collect::<Vec<_>>();
             let col_name = col_name.as_str();
             assert_eq!(row.len(), columns.len());
