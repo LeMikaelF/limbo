@@ -310,34 +310,53 @@ impl Shadow for Drop {
 }
 
 impl Shadow for Insert {
-    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Insert::Values { table, values } => {
-                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
-                    t.rows.extend(values.clone());
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "Table {} does not exist. INSERT statement ignored.",
-                        table
-                    ));
+                let target = tables
+                    .iter_mut()
+                    .find(|t| t.name == *table)
+                    .context("target table not found")?;
+
+                let w = target.columns.len();
+                for v in values {
+                    anyhow::ensure!(v.len() == w, "VALUES arity != target width");
+                    target.rows.push(v.clone());
                 }
+                Ok(vec![])
             }
+
             Insert::Select { table, select } => {
-                let rows = select.shadow(tables)?;
-                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
-                    t.rows.extend(rows);
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "Table {} does not exist. INSERT statement ignored.",
-                        table
-                    ));
+                let mut target = tables
+                    .iter()
+                    .find(|t| t.name == *table)
+                    .context("target table not found")?
+                    .clone();
+
+                let target_w = target.columns.len();
+
+                // rows must be post-projection; Select::shadow should already apply it
+                let out_rows: Vec<Vec<SimValue>> = select.shadow(tables)?;
+
+                let out_w = out_rows.first().map(|r| r.len()).unwrap_or(0);
+                anyhow::ensure!(
+                    out_w == target_w,
+                    "INSERT..SELECT width mismatch: select={}, target={}",
+                    out_w,
+                    target_w
+                );
+
+                for r in out_rows {
+                    // positional mapping, no column list → lengths equal → cheap clone
+                    debug_assert_eq!(r.len(), target_w);
+                    target.rows.push(r);
                 }
+
+                Ok(vec![])
             }
         }
-
-        Ok(vec![])
     }
 }
 
@@ -371,7 +390,18 @@ impl Shadow for FromClause {
             }
         };
 
+        println!(
+            "at the beginning, rows have length {:?}",
+            join_table
+                .rows()
+                .iter()
+                .map(|r| r.len())
+                .unique()
+                .collect_vec()
+        );
+
         for join in &self.joins {
+            println!("join loop executed!");
             let joined_table = tables
                 .iter()
                 .find(|t| t.name == join.table)
@@ -388,13 +418,18 @@ impl Shadow for FromClause {
                         .into_iter()
                         .cartesian_product(joined_table.rows.iter());
 
-                    let mut rows = Vec::new();
+                    let mut rows: Vec<Vec<SimValue>> = Vec::new();
                     for (row1, row2) in all_row_pairs {
                         let row = row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
 
                         let is_in = join.on.test(&row, &join_table);
 
                         if is_in {
+                            if let Some(last) = rows.iter().last()
+                                && row.len() != last.len()
+                            {
+                                panic!("about to add row with inconsistent length");
+                            }
                             rows.push(row);
                         }
                     }
@@ -404,6 +439,8 @@ impl Shadow for FromClause {
             }
         }
 
+        //TODO when this triggers, I've only ever seen self.table being a Table, not a Select, and
+        //no joins.
         assert!(
             join_table.rows().iter().map(|r| r.len()).unique().count() <= 1,
             "shadow rows don't all have the same length! found {:?}. Self: {self:?}",
@@ -478,6 +515,8 @@ impl Shadow for SelectInner {
                     _ => unreachable!("Only expressions are allowed in free selects"),
                 }
             }
+
+            //TODO here, I would have to project the rows, according to ChatGPT.
 
             Ok(JoinTable {
                 tables: Vec::new(),
