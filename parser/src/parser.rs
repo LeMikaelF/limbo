@@ -4071,6 +4071,8 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ast::fmt::{BlankContext, ToTokens};
+
     use super::*;
 
     #[test]
@@ -11581,5 +11583,44 @@ mod tests {
                 assert_eq!(result, expected.clone(), "Input: {rstring:?}");
             }
         }
+    }
+
+    #[test]
+    fn round_trip() {
+        let stmt = Stmt::Select(Select {
+            with: None,
+            body: SelectBody {
+                select: OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ResultColumn::Expr(
+                        Box::new(Expr::Qualified(
+                            Name::exact("t".to_owned()),
+                            Name::exact("a".to_owned()),
+                        )),
+                        None,
+                    )],
+                    from: Some(FromClause {
+                        select: Box::new(SelectTable::Table(
+                            QualifiedName {
+                                db_name: None,
+                                name: Name::exact("t".to_owned()),
+                                alias: None,
+                            },
+                            None,
+                            None,
+                        )),
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        });
+        let result = stmt.displayer(&BlankContext).to_string();
+        assert_eq!("SELECT t.a FROM t", result);
     }
 }

@@ -303,10 +303,13 @@ impl Select {
                                 ast::ResultColumn::Expr(expr.0.clone().into_boxed(), None)
                             }
                             ResultColumn::Star => ast::ResultColumn::Star,
-                            ResultColumn::Column(name) => ast::ResultColumn::Expr(
-                                ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
-                                None,
-                            ),
+                            ResultColumn::Column(name) => {
+                                println!("######## col name: {name}");
+                                ast::ResultColumn::Expr(
+                                    ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
+                                    None,
+                                )
+                            }
                         })
                         .collect(),
                     from: self.body.select.from.as_ref().map(|f| f.to_sql_ast()),
@@ -375,6 +378,7 @@ impl Select {
     }
 }
 
+//TODO here?
 impl Display for Select {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.to_sql_ast().displayer(&BlankContext).fmt(f)

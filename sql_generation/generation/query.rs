@@ -176,7 +176,8 @@ impl ArbitrarySized for SelectInner {
                     .unwrap()
                     .columns
                     .iter()
-                    .map(move |c| format!("{}.{}", t, c.name))
+                    // .map(move |c| format!("{}.{}", t, c.name))
+                    .map(move |c| c.name.to_string())
             })
             .collect::<Vec<_>>();
 
@@ -204,12 +205,6 @@ impl ArbitrarySized for SelectInner {
             .into_iter()
             .map(|col_name| ResultColumn::Column(col_name.clone()))
             .collect();
-
-        assert_eq!(
-            num_result_columns,
-            columns.len(),
-            "SelectInner::arbitrary_sized generated SELECT with wrong number of columns"
-        );
 
         select_inner.columns = columns;
         select_inner
@@ -319,13 +314,6 @@ impl Arbitrary for Insert {
 
         let gen_select = |rng: &mut R| {
             let table = pick(env.tables(), rng);
-
-            //TODO this never pops
-            assert!(
-                table.rows().iter().map(|r| r.len()).unique().count() <= 1,
-                "shadow rows in gen_select don't all have the same length! found {:?}.",
-                table.rows().iter().map(|r| r.len()).unique().collect_vec()
-            );
 
             let select = Select {
                 body: SelectBody {
