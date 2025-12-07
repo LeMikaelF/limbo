@@ -1062,3 +1062,32 @@ fn test_eval_param_only_once(tmp_db: TempDatabase) {
     // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
     assert!(elapsed < std::time::Duration::from_millis(100));
 }
+
+#[turso_macros::test(mvcc)]
+fn test_prepare_semicolon_only_returns_error(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Semicolon-only SQL should return an error, not panic
+    let test_cases = [";", ";;", "; ;", "  ;  "];
+    for sql in test_cases {
+        let result = conn.prepare(sql);
+        assert!(
+            result.is_err(),
+            "Expected error for semicolon-only SQL {:?}, got Ok",
+            sql
+        );
+        match result {
+            Err(LimboError::InvalidArgument(msg)) => {
+                assert!(
+                    msg.contains("no statements"),
+                    "Expected 'no statements' error, got: {}",
+                    msg
+                );
+            }
+            Err(e) => panic!("Expected InvalidArgument error, got: {:?}", e),
+            Ok(_) => unreachable!(),
+        }
+    }
+
+    Ok(())
+}

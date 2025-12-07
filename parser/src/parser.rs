@@ -4140,6 +4140,23 @@ mod tests {
     }
 
     #[test]
+    fn test_semicolon_only_returns_none() {
+        // Inputs that contain only semicolons (and whitespace) should return None
+        // This is valid SQL but produces no command
+        let test_cases = [";", ";;", "; ;", "  ;  ", "\t;\n"];
+        for input in test_cases {
+            let mut p = Parser::new(input.as_bytes());
+            let result = p.next_cmd().unwrap();
+            assert!(
+                result.is_none(),
+                "Expected None for input {:?}, got {:?}",
+                input,
+                result
+            );
+        }
+    }
+
+    #[test]
     fn test_expect_fail() {
         let testcases = vec![
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
