@@ -36,7 +36,8 @@ enum InsertState {
 #[derive(Debug, Clone, Copy)]
 enum InitChunkHeapState {
     Start,
-    PushChunk,
+    /// Pushing chunks to heap, storing the next chunk index to process
+    PushChunk(usize),
 }
 
 struct TempFile {
@@ -88,6 +89,8 @@ pub struct Sorter {
     /// State machine for [Sorter::init_chunk_heap]
     init_chunk_heap_state: InitChunkHeapState,
     pending_completions: Vec<Completion>,
+    /// Chunk indices that need to be retried after IO completion
+    pending_chunk_indices: Vec<usize>,
 }
 
 impl Sorter {
@@ -126,6 +129,7 @@ impl Sorter {
             insert_state: InsertState::Start,
             init_chunk_heap_state: InitChunkHeapState::Start,
             pending_completions: Vec::new(),
+            pending_chunk_indices: Vec::new(),
         }
     }
 
@@ -215,11 +219,12 @@ impl Sorter {
                     }
                 }
                 InsertState::Insert => {
-                    self.records.push(SortableImmutableRecord::new(
+                    let sortable_record = SortableImmutableRecord::new(
                         record.clone(),
                         self.key_len,
                         self.index_key_info.clone(),
-                    )?);
+                    )?;
+                    self.records.push(sortable_record);
                     self.current_buffer_size += payload_size;
                     self.max_payload_size_in_buffer =
                         self.max_payload_size_in_buffer.max(payload_size);
@@ -245,11 +250,11 @@ impl Sorter {
                         Ok(c) => group.add(&c),
                     };
                 }
-                self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
+                self.init_chunk_heap_state = InitChunkHeapState::PushChunk(0);
                 let completion = group.build();
                 io_yield_one!(completion);
             }
-            InitChunkHeapState::PushChunk => {
+            InitChunkHeapState::PushChunk(start_chunk_idx) => {
                 // Make sure all chunks read at least one record into their buffer.
                 turso_assert!(
                     !self.chunks.iter().any(|chunk| matches!(
@@ -258,26 +263,59 @@ impl Sorter {
                     )),
                     "chunks should have been read"
                 );
-                self.chunk_heap.reserve(self.chunks.len());
-                // TODO: blocking will be unnecessary here with IO completions
-                let mut group = CompletionGroup::new(|_| {});
-                for chunk_idx in 0..self.chunks.len() {
-                    if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
-                        group.add(&c);
-                    };
+                if start_chunk_idx == 0 {
+                    self.chunk_heap.reserve(self.chunks.len());
                 }
+                // Process chunks one at a time, yielding on IO
+                for chunk_idx in start_chunk_idx..self.chunks.len() {
+                    match self.push_to_chunk_heap(chunk_idx)? {
+                        Some(c) => {
+                            // This chunk needs IO, save progress and yield
+                            self.init_chunk_heap_state = InitChunkHeapState::PushChunk(chunk_idx);
+                            io_yield_one!(c);
+                        }
+                        None => {
+                            // Chunk successfully pushed (or exhausted), continue to next
+                        }
+                    }
+                }
+                // All chunks processed
                 self.init_chunk_heap_state = InitChunkHeapState::Start;
-                let completion = group.build();
-                if completion.finished() {
-                    Ok(IOResult::Done(()))
-                } else {
-                    io_yield_one!(completion);
-                }
+                Ok(IOResult::Done(()))
             }
         }
     }
 
     fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
+        // First, check if we have pending IO completions to wait for
+        if !self.pending_completions.is_empty() {
+            let mut group = CompletionGroup::new(|_| {});
+            for c in self.pending_completions.drain(..) {
+                group.add(&c);
+            }
+            let completion = group.build();
+            if !completion.succeeded() {
+                return Ok(IOResult::IO(IOCompletions::Single(completion)));
+            }
+        }
+
+        // After IO completes, retry pushing for pending chunks
+        // We need to drain and iterate to avoid borrowing issues
+        let pending_chunks: Vec<usize> = self.pending_chunk_indices.drain(..).collect();
+        for chunk_idx in pending_chunks {
+            match self.push_to_chunk_heap(chunk_idx)? {
+                Some(c) => {
+                    // Still needs more IO
+                    self.pending_completions.push(c);
+                    self.pending_chunk_indices.push(chunk_idx);
+                }
+                None => {
+                    // Successfully pushed or exhausted
+                }
+            }
+        }
+
+        // If we still have pending IO, yield
         if !self.pending_completions.is_empty() {
             let mut group = CompletionGroup::new(|_| {});
             for c in self.pending_completions.drain(..) {
@@ -285,11 +323,14 @@ impl Sorter {
             }
             return Ok(IOResult::IO(IOCompletions::Single(group.build())));
         }
-        // Make sure all chunks read at least one record into their buffer.
+
+        // Now pop from heap and get next record
         if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
-            // TODO: blocking will be unnecessary here with IO completions
+            // Try to push next record from the same chunk to the heap
             if let Some(c) = self.push_to_chunk_heap(next_chunk_idx)? {
+                // This chunk needs IO, track it for retry
                 self.pending_completions.push(c);
+                self.pending_chunk_indices.push(next_chunk_idx);
             }
             Ok(IOResult::Done(Some(next_record.0)))
         } else {
