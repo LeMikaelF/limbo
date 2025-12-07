@@ -59,3 +59,15 @@ do_execsql_test_on_specific_db {:memory:} create-unique-index-with-duplicates-5 
     SELECT count(*) FROM t5;
 } {2}
 
+# DESC index with NULL comparison: UPDATE WHERE col > NULL should not match any rows
+# (comparisons with NULL always yield unknown/false)
+do_execsql_test_on_specific_db {:memory:} desc-index-null-comparison {
+    CREATE TABLE t6(a TEXT, b INT, c REAL);
+    INSERT INTO t6 VALUES ('x', 1, 1.0), (NULL, 2, 2.0), ('y', 3, 3.0);
+    CREATE INDEX idx6 ON t6(a DESC, b, c);
+    UPDATE t6 SET b = 999 WHERE a > NULL;
+    SELECT * FROM t6 ORDER BY b;
+} {x|1|1.0
+|2|2.0
+y|3|3.0}
+
