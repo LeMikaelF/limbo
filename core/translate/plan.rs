@@ -5,7 +5,7 @@ use turso_parser::ast::{
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
+    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, SubqueryPlan, Table},
     translate::{
         collate::get_collseq_from_expr,
         emitter::UpdateRowSource,
@@ -873,7 +873,7 @@ impl TableReferences {
             .chain(self.outer_query_refs.iter().map(|t| &t.table))
             .any(|t| match t {
                 Table::FromClauseSubquery(subquery_table) => {
-                    subquery_table.plan.table_references.contains_table(table)
+                    subquery_table.plan.table_references().contains_table(table)
                 }
                 _ => t == table,
             })
@@ -1095,9 +1095,77 @@ impl JoinedTable {
 
         let table = Table::FromClauseSubquery(FromClauseSubquery {
             name: identifier.clone(),
-            plan: Box::new(plan),
+            plan: SubqueryPlan::Simple(Box::new(plan)),
             columns,
             result_columns_start_reg: None,
+            explicit_column_count: explicit_column_names.as_ref().map(|names| names.len()),
+        });
+        Ok(Self {
+            op: Operation::default_scan_for(&table),
+            table,
+            identifier,
+            internal_id,
+            join_info,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+        })
+    }
+
+    /// Creates a new TableReference for a compound subquery (UNION, UNION ALL, etc.).
+    /// The result columns are derived from the rightmost SELECT in the compound.
+    pub fn new_compound_subquery(
+        identifier: String,
+        compound_plan: Plan,
+        join_info: Option<JoinInfo>,
+        internal_id: TableInternalId,
+        explicit_column_names: Option<Vec<String>>,
+    ) -> Result<Self> {
+        // Extract result columns from the rightmost SELECT in the compound
+        let (result_columns, table_refs) = match &compound_plan {
+            Plan::CompoundSelect { right_most, .. } => {
+                (&right_most.result_columns, &right_most.table_references)
+            }
+            _ => {
+                return Err(crate::LimboError::ParseError(
+                    "new_compound_subquery called with non-compound plan".into(),
+                ))
+            }
+        };
+
+        let mut columns = result_columns
+            .iter()
+            .enumerate()
+            .map(|(i, rc)| {
+                let col_name = explicit_column_names
+                    .as_ref()
+                    .and_then(|names| names.get(i).cloned())
+                    .or_else(|| rc.name(table_refs).map(String::from));
+                Column::new(
+                    col_name,
+                    "BLOB".to_string(),
+                    None,
+                    Type::Blob, // FIXME: infer proper type
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (i, column) in columns.iter_mut().enumerate() {
+            column.set_collation(get_collseq_from_expr(
+                &result_columns[i].expr,
+                table_refs,
+            )?);
+        }
+
+        let table = Table::FromClauseSubquery(FromClauseSubquery {
+            name: identifier.clone(),
+            plan: SubqueryPlan::Compound(Box::new(compound_plan)),
+            columns,
+            result_columns_start_reg: None,
+            explicit_column_count: explicit_column_names.as_ref().map(|names| names.len()),
         });
         Ok(Self {
             op: Operation::default_scan_for(&table),

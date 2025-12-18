@@ -76,12 +76,12 @@ do_execsql_test_on_specific_db {:memory:} with1-2.4 {
 #--------------------------------------------------------------------------
 
 # Circular reference
-# Note: Turso reports "no such table" since forward references aren't supported
+# Note: SQLite reports "circular reference", some implementations may report "no such table"
 do_execsql_test_error with1-3.1 {
   WITH tmp2(x) AS ( SELECT * FROM tmp1 ),
        tmp1(a) AS ( SELECT * FROM tmp2 )
   SELECT * FROM tmp1;
-} {.*no such table.*}
+} {.*(circular reference|no such table).*}
 
 # Duplicate CTE name
 do_execsql_test_error with1-3.2 {

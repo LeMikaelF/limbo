@@ -694,6 +694,21 @@ fn replace_column_number_with_copy_of_column_expr(
     Ok(())
 }
 
+fn count_subquery_plan_cursors(subquery_plan: &crate::schema::SubqueryPlan) -> usize {
+    match subquery_plan {
+        crate::schema::SubqueryPlan::Simple(plan) => count_plan_required_cursors(plan),
+        crate::schema::SubqueryPlan::Compound(compound_plan) => {
+            match compound_plan.as_ref() {
+                Plan::CompoundSelect { left, right_most, .. } => {
+                    count_plan_required_cursors(right_most)
+                        + left.iter().map(|(p, _)| count_plan_required_cursors(p)).sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
+    }
+}
+
 fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
     let num_table_cursors: usize = plan
         .joined_tables()
@@ -707,7 +722,7 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
             Operation::IndexMethodQuery(_) => 1,
             Operation::HashJoin(_) => 2,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            count_plan_required_cursors(&from_clause_subquery.plan)
+            count_subquery_plan_cursors(&from_clause_subquery.plan)
         } else {
             0
         })
@@ -716,6 +731,21 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
     let num_pseudo_cursors = plan.group_by.is_some() as usize + !plan.order_by.is_empty() as usize;
 
     num_table_cursors + num_sorter_cursors + num_pseudo_cursors
+}
+
+fn estimate_subquery_instructions(subquery_plan: &crate::schema::SubqueryPlan) -> usize {
+    match subquery_plan {
+        crate::schema::SubqueryPlan::Simple(plan) => estimate_num_instructions(plan),
+        crate::schema::SubqueryPlan::Compound(compound_plan) => {
+            match compound_plan.as_ref() {
+                Plan::CompoundSelect { left, right_most, .. } => {
+                    estimate_num_instructions(right_most)
+                        + left.iter().map(|(p, _)| estimate_num_instructions(p)).sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
+    }
 }
 
 fn estimate_num_instructions(select: &SelectPlan) -> usize {
@@ -728,7 +758,7 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
             Operation::IndexMethodQuery(_) => 15,
             Operation::HashJoin(_) => 20,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            10 + estimate_num_instructions(&from_clause_subquery.plan)
+            10 + estimate_subquery_instructions(&from_clause_subquery.plan)
         } else {
             0
         })
@@ -739,6 +769,21 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
     let condition_instructions = select.where_clause.len() * 3;
 
     20 + table_instructions + group_by_instructions + order_by_instructions + condition_instructions
+}
+
+fn estimate_subquery_labels(subquery_plan: &crate::schema::SubqueryPlan) -> usize {
+    match subquery_plan {
+        crate::schema::SubqueryPlan::Simple(plan) => estimate_num_labels(plan),
+        crate::schema::SubqueryPlan::Compound(compound_plan) => {
+            match compound_plan.as_ref() {
+                Plan::CompoundSelect { left, right_most, .. } => {
+                    estimate_num_labels(right_most)
+                        + left.iter().map(|(p, _)| estimate_num_labels(p)).sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
+    }
 }
 
 fn estimate_num_labels(select: &SelectPlan) -> usize {
@@ -753,7 +798,7 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
             Operation::IndexMethodQuery(_) => 3,
             Operation::HashJoin(_) => 3,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            3 + estimate_num_labels(&from_clause_subquery.plan)
+            3 + estimate_subquery_labels(&from_clause_subquery.plan)
         } else {
             0
         })

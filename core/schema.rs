@@ -119,7 +119,7 @@ impl Trigger {
 
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{SelectPlan, TableReferences};
+use crate::translate::plan::{Plan, SelectPlan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
@@ -1405,6 +1405,10 @@ pub struct RecursiveCte {
     pub recursive_member: turso_parser::ast::OneSelect,
     /// Pre-planned anchor query - set during query planning.
     pub anchor_plan: Option<Box<crate::translate::plan::SelectPlan>>,
+    /// The number of explicitly specified column names in the CTE definition.
+    /// Used for lazy validation: SQLite only validates column count when the CTE is used.
+    /// If None, no explicit column names were specified; if Some(n), n names were specified.
+    pub explicit_column_count: Option<usize>,
 }
 
 impl Table {
@@ -1699,13 +1703,77 @@ impl PseudoCursorType {
 pub struct FromClauseSubquery {
     /// The name of the derived table; uses the alias if available.
     pub name: String,
-    /// The query plan for the derived table.
-    pub plan: Box<SelectPlan>,
+    /// The query plan for the derived table (can be simple SELECT or compound SELECT).
+    pub plan: SubqueryPlan,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
+    /// The number of explicitly specified column names in a CTE definition.
+    /// Used for lazy validation: SQLite only validates column count when the CTE is used.
+    /// If None, no explicit column names were specified; if Some(n), n names were specified.
+    pub explicit_column_count: Option<usize>,
+}
+
+/// The plan for a subquery, which can be either a simple SELECT or a compound SELECT.
+#[derive(Debug, Clone)]
+pub enum SubqueryPlan {
+    /// A simple SELECT query
+    Simple(Box<SelectPlan>),
+    /// A compound SELECT query (UNION, UNION ALL, INTERSECT, EXCEPT)
+    Compound(Box<Plan>),
+}
+
+impl SubqueryPlan {
+    /// Returns the table references for this subquery.
+    /// For compound selects, returns the table references of the rightmost select.
+    pub fn table_references(&self) -> &TableReferences {
+        match self {
+            SubqueryPlan::Simple(plan) => &plan.table_references,
+            SubqueryPlan::Compound(plan) => {
+                match plan.as_ref() {
+                    Plan::CompoundSelect { right_most, .. } => &right_most.table_references,
+                    _ => unreachable!("Compound subquery plan is not a CompoundSelect"),
+                }
+            }
+        }
+    }
+
+    /// Returns the query destination for this subquery.
+    /// For compound selects, returns the query destination of the rightmost select.
+    pub fn query_destination(&self) -> &crate::translate::plan::QueryDestination {
+        match self {
+            SubqueryPlan::Simple(plan) => &plan.query_destination,
+            SubqueryPlan::Compound(plan) => {
+                match plan.as_ref() {
+                    Plan::CompoundSelect { right_most, .. } => &right_most.query_destination,
+                    _ => unreachable!("Compound subquery plan is not a CompoundSelect"),
+                }
+            }
+        }
+    }
+
+    /// Returns whether this is a simple select plan.
+    pub fn is_simple(&self) -> bool {
+        matches!(self, SubqueryPlan::Simple(_))
+    }
+
+    /// Returns the simple select plan if this is a simple subquery, None otherwise.
+    pub fn as_simple(&self) -> Option<&SelectPlan> {
+        match self {
+            SubqueryPlan::Simple(plan) => Some(plan),
+            SubqueryPlan::Compound(_) => None,
+        }
+    }
+
+    /// Returns a mutable reference to the simple select plan if this is a simple subquery.
+    pub fn as_simple_mut(&mut self) -> Option<&mut SelectPlan> {
+        match self {
+            SubqueryPlan::Simple(plan) => Some(plan),
+            SubqueryPlan::Compound(_) => None,
+        }
+    }
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {

@@ -4,9 +4,10 @@ use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
     emit_explain,
-    schema::{Index, IndexColumn, RecursiveCte, Table},
+    schema::{Index, IndexColumn, RecursiveCte, SubqueryPlan, Table},
     translate::{
         collate::get_collseq_from_expr,
+        compound_select::emit_program_for_compound_select,
         emitter::emit_program_for_select,
         expr::{unwrap_parens, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
@@ -549,8 +550,12 @@ pub fn emit_from_clause_subqueries(
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             // Emit the subquery and get the start register of the result columns.
-            let result_columns_start =
-                emit_from_clause_subquery(program, &mut from_clause_subquery.plan, t_ctx)?;
+            let result_columns_start = emit_from_clause_subquery(
+                program,
+                &mut from_clause_subquery.plan,
+                from_clause_subquery.columns.len(),
+                t_ctx,
+            )?;
             // Set the start register of the subquery's result columns.
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
@@ -590,7 +595,7 @@ pub fn emit_from_clause_subqueries(
 
 /// Emit a FROM clause subquery and return the start register of the result columns.
 /// This is done by emitting a coroutine that stores the result columns in sequential registers.
-/// Each FROM clause subquery has its own separate SelectPlan which is wrapped in a coroutine.
+/// Each FROM clause subquery has its own separate plan which is wrapped in a coroutine.
 ///
 /// The resulting bytecode from a subquery is mostly exactly the same as a regular query, except:
 /// - it ends in an EndCoroutine instead of a Halt.
@@ -599,9 +604,26 @@ pub fn emit_from_clause_subqueries(
 ///   so that translate_expr() can read the result columns of the subquery,
 ///   as if it were reading from a regular table.
 ///
-/// Since a subquery has its own SelectPlan, it can contain nested subqueries,
+/// Since a subquery has its own plan, it can contain nested subqueries,
 /// which can contain even more nested subqueries, etc.
 pub fn emit_from_clause_subquery(
+    program: &mut ProgramBuilder,
+    plan: &mut SubqueryPlan,
+    num_columns: usize,
+    t_ctx: &mut TranslateCtx,
+) -> Result<usize> {
+    match plan {
+        SubqueryPlan::Simple(select_plan) => {
+            emit_simple_subquery(program, select_plan, t_ctx)
+        }
+        SubqueryPlan::Compound(compound_plan) => {
+            emit_compound_subquery(program, compound_plan, num_columns, t_ctx)
+        }
+    }
+}
+
+/// Emit a simple SELECT subquery as a coroutine.
+fn emit_simple_subquery(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
     t_ctx: &mut TranslateCtx,
@@ -618,7 +640,7 @@ pub fn emit_from_clause_subquery(
             // The parent query will use this register to reinitialize the coroutine when it needs to run multiple times.
             *coroutine_implementation_start = coroutine_implementation_start_offset;
         }
-        _ => unreachable!("emit_from_clause_subquery called on non-subquery"),
+        _ => unreachable!("emit_simple_subquery called on non-subquery"),
     }
     let end_coroutine_label = program.allocate_label();
     let mut metadata = TranslateCtx {
@@ -653,6 +675,51 @@ pub fn emit_from_clause_subquery(
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
+}
+
+/// Emit a compound SELECT (UNION, UNION ALL, etc.) subquery as a coroutine.
+fn emit_compound_subquery(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    _num_columns: usize,
+    t_ctx: &mut TranslateCtx,
+) -> Result<usize> {
+    let yield_reg = program.alloc_register();
+    let coroutine_implementation_start_offset = program.allocate_label();
+
+    // Set the query destination for all plans in the compound to yield to our coroutine
+    if let Plan::CompoundSelect { left, right_most, .. } = plan {
+        // Set destination for all left plans
+        for (left_plan, _) in left.iter_mut() {
+            left_plan.query_destination = QueryDestination::CoroutineYield {
+                yield_reg,
+                coroutine_implementation_start: coroutine_implementation_start_offset,
+            };
+        }
+        // Set destination for rightmost plan
+        right_most.query_destination = QueryDestination::CoroutineYield {
+            yield_reg,
+            coroutine_implementation_start: coroutine_implementation_start_offset,
+        };
+    }
+
+    let subquery_body_end_label = program.allocate_label();
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition: subquery_body_end_label,
+        start_offset: coroutine_implementation_start_offset,
+    });
+    program.preassign_label_to_next_insn(coroutine_implementation_start_offset);
+
+    // Emit the compound select. Note: compound selects handle yielding internally
+    // through their query destinations. Results are stored starting at yield_reg + 1.
+    emit_program_for_compound_select(program, &t_ctx.resolver, plan.clone())?;
+
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(subquery_body_end_label);
+
+    // Compound selects store results at yield_reg + 1 onwards when using CoroutineYield
+    Ok(yield_reg + 1)
 }
 
 /// Helper function to bind CTE column references in expressions.
@@ -1144,6 +1211,7 @@ pub fn emit_recursive_cte(
         anchor: recursive_cte.anchor.clone(),
         recursive_member: recursive_cte.recursive_member.clone(),
         anchor_plan: None, // Not needed for table references
+        explicit_column_count: recursive_cte.explicit_column_count,
     });
     joined_tables_for_recursive.push(JoinedTable {
         op: Operation::default_scan_for(&cte_table_for_refs),

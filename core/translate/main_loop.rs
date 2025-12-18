@@ -705,7 +705,7 @@ pub fn open_loop(
                     }
                     (Scan::Subquery, Table::FromClauseSubquery(from_clause_subquery)) => {
                         let (yield_reg, coroutine_implementation_start) =
-                            match &from_clause_subquery.plan.query_destination {
+                            match from_clause_subquery.plan.query_destination() {
                                 QueryDestination::CoroutineYield {
                                     yield_reg,
                                     coroutine_implementation_start,
