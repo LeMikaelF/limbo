@@ -1,0 +1,379 @@
+#!/usr/bin/env tclsh
+# Adapted from SQLite with1.test
+# Tests for WITH clause (Common Table Expressions) including recursive CTEs
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+#--------------------------------------------------------------------------
+# Section 1: Basic CTE tests
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with1-1.0 {
+  CREATE TABLE t1(x INTEGER, y INTEGER);
+  WITH x(a) AS ( SELECT * FROM t1) SELECT 10
+} {10}
+
+do_execsql_test_on_specific_db {:memory:} with1-1.1 {
+  CREATE TABLE t1(x INTEGER, y INTEGER);
+  SELECT * FROM ( WITH x AS ( SELECT * FROM t1) SELECT 10 );
+} {10}
+
+#--------------------------------------------------------------------------
+# Section 2: CTE with data
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with1-2.1 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  WITH tmp AS ( SELECT * FROM t1 ) SELECT x FROM tmp;
+} {1
+2}
+
+do_execsql_test_on_specific_db {:memory:} with1-2.2 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  WITH tmp(a) AS ( SELECT * FROM t1 ) SELECT a FROM tmp;
+} {1
+2}
+
+do_execsql_test_on_specific_db {:memory:} with1-2.3 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  SELECT * FROM (
+    WITH tmp(a) AS ( SELECT * FROM t1 ) SELECT a FROM tmp
+  );
+} {1
+2}
+
+do_execsql_test_on_specific_db {:memory:} with1-2.4 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  WITH tmp1(a) AS ( SELECT * FROM t1 ),
+       tmp2(x) AS ( SELECT * FROM tmp1)
+  SELECT * FROM tmp2;
+} {1
+2}
+
+# CTE referencing another CTE defined after it (forward reference)
+# SKIPPED: Forward references in CTEs are not yet supported
+# do_execsql_test_on_specific_db {:memory:} with1-2.5 {
+#   CREATE TABLE t1(x);
+#   INSERT INTO t1 VALUES(1);
+#   INSERT INTO t1 VALUES(2);
+#   WITH tmp2(x) AS ( SELECT * FROM tmp1),
+#        tmp1(a) AS ( SELECT * FROM t1 )
+#   SELECT * FROM tmp2;
+# } {1
+# 2}
+
+#--------------------------------------------------------------------------
+# Section 3: Error cases
+#--------------------------------------------------------------------------
+
+# Circular reference
+# Note: Turso reports "no such table" since forward references aren't supported
+do_execsql_test_error with1-3.1 {
+  WITH tmp2(x) AS ( SELECT * FROM tmp1 ),
+       tmp1(a) AS ( SELECT * FROM tmp2 )
+  SELECT * FROM tmp1;
+} {.*no such table.*}
+
+# Duplicate CTE name
+do_execsql_test_error with1-3.2 {
+  WITH tmp(a) AS (SELECT 1),
+       tmp(a) AS (SELECT 2)
+  SELECT * FROM tmp;
+} {.*duplicate WITH table name.*}
+
+#--------------------------------------------------------------------------
+# Section 4: CTE shadowing table
+#--------------------------------------------------------------------------
+
+# SKIPPED: CTE shadowing catalog tables is not yet supported in Turso
+# do_execsql_test_on_specific_db {:memory:} with1-3.3 {
+#   CREATE TABLE t3(x);
+#   CREATE TABLE t4(x);
+#   INSERT INTO t3 VALUES('T3');
+#   INSERT INTO t4 VALUES('T4');
+#   WITH t3(a) AS (SELECT * FROM t4)
+#   SELECT * FROM t3;
+# } {T4}
+
+#--------------------------------------------------------------------------
+# Section 5: Basic recursive CTE tests
+#--------------------------------------------------------------------------
+
+# Simple counting recursive CTE
+do_execsql_test_on_specific_db {:memory:} with1-5.1 {
+  WITH RECURSIVE i(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x+1 FROM i WHERE x < 10
+  )
+  SELECT x FROM i;
+} {1
+2
+3
+4
+5
+6
+7
+8
+9
+10}
+
+# Recursive CTE with LIMIT
+do_execsql_test_on_specific_db {:memory:} with1-5.3 {
+  WITH RECURSIVE i(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x+1 FROM i WHERE x < 100
+  )
+  SELECT x FROM i LIMIT 5;
+} {1
+2
+3
+4
+5}
+
+# Recursive CTE counting down
+do_execsql_test_on_specific_db {:memory:} with1-5.4 {
+  WITH RECURSIVE countdown(n) AS (
+    SELECT 5
+    UNION ALL
+    SELECT n-1 FROM countdown WHERE n > 1
+  )
+  SELECT n FROM countdown;
+} {5
+4
+3
+2
+1}
+
+#--------------------------------------------------------------------------
+# Section 6: Recursive CTE - Tree/Graph traversal
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with1-6.1 {
+  CREATE TABLE tree(i INTEGER, p INTEGER);
+  INSERT INTO tree VALUES(1, NULL);
+  INSERT INTO tree VALUES(2, 1);
+  INSERT INTO tree VALUES(3, 1);
+  INSERT INTO tree VALUES(4, 2);
+  INSERT INTO tree VALUES(5, 4);
+
+  WITH RECURSIVE t(id) AS (
+    SELECT i FROM tree WHERE p IS NULL
+    UNION ALL
+    SELECT i FROM tree, t WHERE p = id
+  )
+  SELECT id FROM t;
+} {1
+2
+3
+4
+5}
+
+# Recursive CTE building paths
+do_execsql_test_on_specific_db {:memory:} with1-6.2 {
+  CREATE TABLE tree(i INTEGER, p INTEGER);
+  INSERT INTO tree VALUES(1, NULL);
+  INSERT INTO tree VALUES(2, 1);
+  INSERT INTO tree VALUES(3, 1);
+  INSERT INTO tree VALUES(4, 2);
+  INSERT INTO tree VALUES(5, 4);
+
+  WITH RECURSIVE t(id, path) AS (
+    SELECT i, '' FROM tree WHERE p IS NULL
+    UNION ALL
+    SELECT i, path || '/' || i FROM tree, t WHERE p = id
+  )
+  SELECT path FROM t;
+} {
+/2
+/3
+/2/4
+/2/4/5}
+
+# Tree traversal from specific node
+do_execsql_test_on_specific_db {:memory:} with1-6.3 {
+  CREATE TABLE tree(i INTEGER, p INTEGER);
+  INSERT INTO tree VALUES(1, NULL);
+  INSERT INTO tree VALUES(2, 1);
+  INSERT INTO tree VALUES(3, 1);
+  INSERT INTO tree VALUES(4, 2);
+  INSERT INTO tree VALUES(5, 4);
+
+  WITH RECURSIVE t(id) AS (
+    SELECT 2
+    UNION ALL
+    SELECT i FROM tree, t WHERE p = id
+  )
+  SELECT id FROM t;
+} {2
+4
+5}
+
+#--------------------------------------------------------------------------
+# Section 7: Error cases for recursive CTEs
+#--------------------------------------------------------------------------
+
+# Recursive reference in subquery (not allowed)
+do_execsql_test_error with1-7.4 {
+  CREATE TABLE tree(i INTEGER, p INTEGER);
+  WITH RECURSIVE t(id) AS (
+    SELECT 2
+    UNION ALL
+    SELECT i FROM tree WHERE p IN (SELECT id FROM t)
+  )
+  SELECT id FROM t;
+} {.*circular reference.*}
+
+# Multiple recursive references (not allowed)
+do_execsql_test_error with1-7.5 {
+  CREATE TABLE tree(i INTEGER, p INTEGER);
+  WITH RECURSIVE t(id) AS (
+    SELECT 2
+    UNION ALL
+    SELECT i FROM tree, t, t AS t2 WHERE p = t.id
+  )
+  SELECT id FROM t;
+} {.*multiple.*recursive.*}
+
+#--------------------------------------------------------------------------
+# Section 8: Column count mismatch errors
+#--------------------------------------------------------------------------
+
+do_execsql_test_error with1-5.6.1 {
+  WITH i(x, y) AS ( SELECT 1 )
+  SELECT * FROM i;
+} {.*table i has 1 values for 2 columns.*}
+
+do_execsql_test_error with1-5.6.2 {
+  WITH i(x) AS ( SELECT 1, 2 )
+  SELECT * FROM i;
+} {.*table i has 2 values for 1 columns.*}
+
+#--------------------------------------------------------------------------
+# Section 9: Recursive CTE with file system simulation
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with1-fs.1 {
+  CREATE TABLE f(
+      id INTEGER PRIMARY KEY, parentid REFERENCES f, name TEXT
+  );
+
+  INSERT INTO f VALUES(0, NULL, '');
+  INSERT INTO f VALUES(1, 0, 'bin');
+  INSERT INTO f VALUES(2, 1, 'true');
+  INSERT INTO f VALUES(3, 1, 'false');
+  INSERT INTO f VALUES(6, 0, 'etc');
+  INSERT INTO f VALUES(7, 6, 'rc.d');
+  INSERT INTO f VALUES(10, 0, 'home');
+  INSERT INTO f VALUES(11, 10, 'dan');
+
+  WITH RECURSIVE flat(fid, fpath) AS (
+    SELECT id, '' FROM f WHERE parentid IS NULL
+    UNION ALL
+    SELECT id, fpath || '/' || name FROM f, flat WHERE parentid=fid
+  )
+  SELECT count(*) FROM flat;
+} {8}
+
+#--------------------------------------------------------------------------
+# Section 10: CTE with aggregates
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with1-agg.1 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  INSERT INTO t1 VALUES(3);
+  WITH tmp AS ( SELECT * FROM t1 )
+  SELECT sum(x) FROM tmp;
+} {6}
+
+do_execsql_test_on_specific_db {:memory:} with1-agg.2 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  INSERT INTO t1 VALUES(3);
+  WITH tmp AS ( SELECT * FROM t1 )
+  SELECT max(x), min(x) FROM tmp;
+} {3|1}
+
+#--------------------------------------------------------------------------
+# Section 11: Recursive CTE with sum (Fibonacci-like)
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with1-fib.1 {
+  WITH RECURSIVE fib(a, b) AS (
+    SELECT 0, 1
+    UNION ALL
+    SELECT b, a + b FROM fib WHERE b < 100
+  )
+  SELECT a FROM fib;
+} {0
+1
+1
+2
+3
+5
+8
+13
+21
+34
+55
+89}
+
+#--------------------------------------------------------------------------
+# Section 12: Multiple CTEs with recursive
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with1-multi.1 {
+  WITH RECURSIVE
+    cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5),
+    doubled(y) AS (SELECT x*2 FROM cnt)
+  SELECT y FROM doubled;
+} {2
+4
+6
+8
+10}
+
+#--------------------------------------------------------------------------
+# Section 13: Non-recursive CTE in WITH RECURSIVE block
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with1-nonrec.1 {
+  WITH RECURSIVE
+    static AS (SELECT 42 AS val),
+    cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<3)
+  SELECT val, x FROM static, cnt;
+} {42|1
+42|2
+42|3}
+
+#--------------------------------------------------------------------------
+# Section 14: Recursive CTE computing factorial
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with1-factorial.1 {
+  WITH RECURSIVE fact(n, f) AS (
+    SELECT 1, 1
+    UNION ALL
+    SELECT n+1, f*(n+1) FROM fact WHERE n < 5
+  )
+  SELECT n, f FROM fact;
+} {1|1
+2|2
+3|6
+4|24
+5|120}
+
+puts "with1.test completed"

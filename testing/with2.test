@@ -1,0 +1,314 @@
+#!/usr/bin/env tclsh
+# Adapted from SQLite with2.test
+# Additional tests for WITH clause (Common Table Expressions)
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+#--------------------------------------------------------------------------
+# Section 1: Basic CTE with aggregates
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-1.0 {
+  CREATE TABLE t1(a);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+} {}
+
+do_execsql_test_on_specific_db {:memory:} with2-1.1 {
+  CREATE TABLE t1(a);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  WITH x1 AS (SELECT * FROM t1)
+  SELECT sum(a) FROM x1;
+} {3}
+
+do_execsql_test_on_specific_db {:memory:} with2-1.2 {
+  CREATE TABLE t1(a);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  WITH x1 AS (SELECT * FROM t1)
+  SELECT (SELECT sum(a) FROM x1);
+} {3}
+
+#--------------------------------------------------------------------------
+# Section 2: CTE with multiple references
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-1.9 {
+  CREATE TABLE t1(a);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  WITH x1 AS (SELECT * FROM t1)
+  SELECT (SELECT sum(a) FROM x1), (SELECT max(a) FROM x1);
+} {3|2}
+
+do_execsql_test_on_specific_db {:memory:} with2-1.10 {
+  CREATE TABLE t1(a);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  WITH x1 AS (SELECT * FROM t1)
+  SELECT (SELECT sum(a) FROM x1), (SELECT max(a) FROM x1), a FROM x1;
+} {3|2|1
+3|2|2}
+
+#--------------------------------------------------------------------------
+# Section 3: Nested CTEs
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-1.11 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1);
+  INSERT INTO t1 VALUES(2);
+  WITH
+  i(x) AS (
+    WITH
+    j(x) AS ( SELECT * FROM i ),
+    i(x) AS ( SELECT * FROM t1 )
+    SELECT * FROM j
+  )
+  SELECT * FROM i;
+} {1
+2}
+
+#--------------------------------------------------------------------------
+# Section 4: Recursive CTE with string concatenation
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-1.12 {
+  WITH RECURSIVE
+    r(i) AS (
+      SELECT '.'
+      UNION ALL
+      SELECT i || '.' FROM r WHERE length(i) < 5
+    )
+  SELECT * FROM r;
+} {.
+..
+...
+....
+.....}
+
+#--------------------------------------------------------------------------
+# Section 5: Recursive CTE starting from arbitrary value
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-1.14 {
+  WITH RECURSIVE
+  t4(x) AS (
+    SELECT 4
+    UNION ALL
+    SELECT x+1 FROM t4 WHERE x<10
+  )
+  SELECT * FROM t4;
+} {4
+5
+6
+7
+8
+9
+10}
+
+#--------------------------------------------------------------------------
+# Section 6: Multiple recursive references error
+#--------------------------------------------------------------------------
+
+do_execsql_test_error with2-1.16 {
+  WITH RECURSIVE
+  t4(x) AS (
+    SELECT 4
+    UNION ALL
+    SELECT x+1 FROM t4, t4 AS t5 WHERE t4.x<10
+  )
+  SELECT * FROM t4;
+} {.*multiple.*recursive.*}
+
+#--------------------------------------------------------------------------
+# Section 7: Circular reference detection
+#--------------------------------------------------------------------------
+
+do_execsql_test_error with2-3.1 {
+  WITH tmp1(x) AS ( SELECT * FROM tmp2 ),
+       tmp2(x) AS ( SELECT * FROM tmp1 )
+  SELECT * FROM tmp1;
+} {.*circular reference.*}
+
+do_execsql_test_error with2-3.2 {
+  WITH tmp1(x) AS ( SELECT * FROM tmp1 )
+  SELECT * FROM tmp1;
+} {.*circular reference.*}
+
+do_execsql_test_error with2-3.3 {
+  WITH tmp1(x) AS ( SELECT * FROM tmp3 ),
+       tmp2(x) AS ( SELECT * FROM tmp1 ),
+       tmp3(x) AS ( SELECT * FROM tmp2 )
+  SELECT * FROM tmp1;
+} {.*circular reference.*}
+
+#--------------------------------------------------------------------------
+# Section 8: CTE column mismatch
+#--------------------------------------------------------------------------
+
+do_execsql_test_error with2-4.1 {
+  WITH tmp(x, y, z) AS ( SELECT 1, 2 )
+  SELECT * FROM tmp;
+} {.*table tmp has 2 values for 3 columns.*}
+
+#--------------------------------------------------------------------------
+# Section 9: Recursive CTE as insert source
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-insert.1 {
+  CREATE TABLE dest(val INTEGER);
+  WITH RECURSIVE cnt(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x+1 FROM cnt WHERE x < 5
+  )
+  INSERT INTO dest SELECT x FROM cnt;
+  SELECT * FROM dest;
+} {1
+2
+3
+4
+5}
+
+#--------------------------------------------------------------------------
+# Section 10: Complex nested recursive CTE
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-nested.1 {
+  WITH RECURSIVE
+    outer_cte(n) AS (
+      SELECT 1
+      UNION ALL
+      SELECT n + 1 FROM outer_cte WHERE n < 3
+    ),
+    inner_cte(m) AS (
+      SELECT n * 10 FROM outer_cte
+    )
+  SELECT m FROM inner_cte;
+} {10
+20
+30}
+
+#--------------------------------------------------------------------------
+# Section 11: CTE with JOIN
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-join.1 {
+  CREATE TABLE t1(a INTEGER, b TEXT);
+  CREATE TABLE t2(c INTEGER, d TEXT);
+  INSERT INTO t1 VALUES(1, 'one'), (2, 'two');
+  INSERT INTO t2 VALUES(1, 'ONE'), (3, 'THREE');
+
+  WITH
+    cte1 AS (SELECT * FROM t1),
+    cte2 AS (SELECT * FROM t2)
+  SELECT a, b, d FROM cte1 JOIN cte2 ON a = c;
+} {1|one|ONE}
+
+#--------------------------------------------------------------------------
+# Section 12: Recursive CTE with WHERE clause filtering
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-filter.1 {
+  WITH RECURSIVE cnt(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x+1 FROM cnt WHERE x < 10
+  )
+  SELECT x FROM cnt WHERE x % 2 = 0;
+} {2
+4
+6
+8
+10}
+
+#--------------------------------------------------------------------------
+# Section 13: Recursive CTE with ORDER BY on outer query
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-order.1 {
+  WITH RECURSIVE cnt(x) AS (
+    SELECT 5
+    UNION ALL
+    SELECT x-1 FROM cnt WHERE x > 1
+  )
+  SELECT x FROM cnt ORDER BY x;
+} {1
+2
+3
+4
+5}
+
+#--------------------------------------------------------------------------
+# Section 14: Recursive CTE generating powers of 2
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-powers.1 {
+  WITH RECURSIVE powers(n, p) AS (
+    SELECT 1, 1
+    UNION ALL
+    SELECT n+1, p*2 FROM powers WHERE n < 8
+  )
+  SELECT n, p FROM powers;
+} {1|1
+2|2
+3|4
+4|8
+5|16
+6|32
+7|64
+8|128}
+
+#--------------------------------------------------------------------------
+# Section 15: Non-recursive CTE used multiple times
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-reuse.1 {
+  CREATE TABLE data(x INTEGER);
+  INSERT INTO data VALUES(10), (20), (30);
+
+  WITH summary AS (SELECT sum(x) as total, avg(x) as average FROM data)
+  SELECT total, average, total - average FROM summary;
+} {60|20.0|40.0}
+
+#--------------------------------------------------------------------------
+# Section 16: Recursive CTE with CASE expression
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with2-case.1 {
+  WITH RECURSIVE cnt(x, label) AS (
+    SELECT 1, 'one'
+    UNION ALL
+    SELECT x+1,
+           CASE x+1
+             WHEN 2 THEN 'two'
+             WHEN 3 THEN 'three'
+             ELSE 'many'
+           END
+    FROM cnt WHERE x < 5
+  )
+  SELECT x, label FROM cnt;
+} {1|one
+2|two
+3|three
+4|many
+5|many}
+
+#--------------------------------------------------------------------------
+# Section 17: CTE referencing itself without RECURSIVE keyword (should error)
+#--------------------------------------------------------------------------
+
+# This should error because the CTE references itself but RECURSIVE is not specified
+do_execsql_test_error with2-norecursive.1 {
+  WITH cnt(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x+1 FROM cnt WHERE x < 5
+  )
+  SELECT x FROM cnt;
+} {.*}
+
+puts "with2.test completed"

@@ -1327,6 +1327,10 @@ impl Clone for Schema {
                     name.clone(),
                     Arc::new(Table::FromClauseSubquery(from_clause_subquery.clone())),
                 ),
+                Table::RecursiveCte(cte) => (
+                    name.clone(),
+                    Arc::new(Table::RecursiveCte(cte.clone())),
+                ),
             })
             .collect();
         let indexes = self
@@ -1385,6 +1389,20 @@ pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
     FromClauseSubquery(FromClauseSubquery),
+    RecursiveCte(RecursiveCte),
+}
+
+/// A recursive Common Table Expression.
+#[derive(Debug, Clone)]
+pub struct RecursiveCte {
+    /// The name of the CTE.
+    pub name: String,
+    /// The columns of the CTE (derived from the anchor query).
+    pub columns: Vec<Column>,
+    /// The anchor (base case) query AST - doesn't reference the CTE.
+    pub anchor: turso_parser::ast::OneSelect,
+    /// The recursive member query AST - references the CTE.
+    pub recursive_member: turso_parser::ast::OneSelect,
 }
 
 impl Table {
@@ -1393,6 +1411,7 @@ impl Table {
             Table::BTree(table) => table.root_page,
             Table::Virtual(_) => unimplemented!(),
             Table::FromClauseSubquery(_) => unimplemented!(),
+            Table::RecursiveCte(_) => unimplemented!(),
         }
     }
 
@@ -1401,6 +1420,7 @@ impl Table {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
+            Self::RecursiveCte(cte) => &cte.name,
         }
     }
 
@@ -1411,6 +1431,7 @@ impl Table {
             Self::FromClauseSubquery(from_clause_subquery) => {
                 from_clause_subquery.columns.get(index)
             }
+            Self::RecursiveCte(cte) => cte.columns.get(index),
         }
     }
 
@@ -1429,6 +1450,11 @@ impl Table {
                 .iter()
                 .enumerate()
                 .find(|(_, col)| col.name.as_ref() == Some(&name)),
+            Self::RecursiveCte(cte) => cte
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, col)| col.name.as_ref() == Some(&name)),
         }
     }
 
@@ -1437,6 +1463,7 @@ impl Table {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
+            Self::RecursiveCte(cte) => &cte.columns,
         }
     }
 
@@ -1445,6 +1472,7 @@ impl Table {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCte(_) => None,
         }
     }
 
@@ -1453,6 +1481,7 @@ impl Table {
             Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCte(_) => None,
         }
     }
 

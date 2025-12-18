@@ -1013,6 +1013,10 @@ fn optimize_table_access(
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::Scan(Scan::Subquery);
             }
+            AccessMethodParams::RecursiveCte => {
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::Scan(Scan::RecursiveCte);
+            }
             AccessMethodParams::HashJoin {
                 build_table_idx,
                 probe_table_idx,

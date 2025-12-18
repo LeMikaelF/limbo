@@ -1,0 +1,269 @@
+#!/usr/bin/env tclsh
+# Adapted from SQLite with3.test
+# Additional tests for WITH clause focusing on edge cases
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+#--------------------------------------------------------------------------
+# Section 1: Error handling for missing tables in CTE
+#--------------------------------------------------------------------------
+
+do_execsql_test_error with3-1.0 {
+  WITH i(x) AS (
+    WITH j AS (SELECT 10)
+    SELECT 5 FROM t0 UNION SELECT 8 FROM m
+  )
+  SELECT * FROM i;
+} {.*no such table.*}
+
+#--------------------------------------------------------------------------
+# Section 2: Complex nested CTE scoping
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-2.0 {
+ WITH
+  x1 AS (SELECT 10),
+  x2 AS (SELECT 11),
+  x3 AS (
+    SELECT * FROM x1 UNION ALL SELECT * FROM x2
+  ),
+  x4 AS (
+    WITH
+    x1 AS (SELECT 12),
+    x2 AS (SELECT 13)
+    SELECT * FROM x3
+  )
+  SELECT * FROM x4;
+} {10
+11}
+
+#--------------------------------------------------------------------------
+# Section 3: CTE with INSERT
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-2.1 {
+  CREATE TABLE t1(x);
+  WITH
+    x1(a) AS (SELECT 100)
+  INSERT INTO t1(x)
+    SELECT * FROM (WITH x2(y) AS (SELECT * FROM x1) SELECT y+a FROM x1, x2);
+  SELECT * FROM t1;
+} {200}
+
+#--------------------------------------------------------------------------
+# Section 4: CTE column count validation
+#--------------------------------------------------------------------------
+
+do_execsql_test_error with3-4.1 {
+  WITH tmp(a, b, c) AS (SELECT 1, 2)
+  SELECT * FROM tmp;
+} {.*table tmp has 2 values for 3 columns.*}
+
+do_execsql_test_error with3-4.2 {
+  WITH tmp(a) AS (SELECT 1, 2, 3)
+  SELECT * FROM tmp;
+} {.*table tmp has 3 values for 1 columns.*}
+
+#--------------------------------------------------------------------------
+# Section 5: Recursive CTE materialization
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-5.1 {
+  WITH RECURSIVE cnt(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x + 1 FROM cnt WHERE x < 5
+  )
+  SELECT a.x, b.x FROM cnt a, cnt b WHERE a.x <= b.x AND b.x <= a.x + 1;
+} {1|1
+1|2
+2|2
+2|3
+3|3
+3|4
+4|4
+4|5
+5|5}
+
+#--------------------------------------------------------------------------
+# Section 6: Empty recursive CTE result
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-6.1 {
+  WITH RECURSIVE cnt(x) AS (
+    SELECT 1 WHERE 0
+    UNION ALL
+    SELECT x + 1 FROM cnt WHERE x < 5
+  )
+  SELECT count(*) FROM cnt;
+} {0}
+
+#--------------------------------------------------------------------------
+# Section 7: Recursive CTE with NULL handling
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-7.1 {
+  WITH RECURSIVE cnt(x, y) AS (
+    SELECT 1, NULL
+    UNION ALL
+    SELECT x + 1, x FROM cnt WHERE x < 4
+  )
+  SELECT x, y FROM cnt;
+} {1|
+2|1
+3|2
+4|3}
+
+#--------------------------------------------------------------------------
+# Section 8: CTE with UNION (not UNION ALL)
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-8.1 {
+  WITH RECURSIVE cnt(x) AS (
+    SELECT 1
+    UNION
+    SELECT (x + 1) % 5 FROM cnt WHERE x < 10
+  )
+  SELECT x FROM cnt ORDER BY x;
+} {0
+1
+2
+3
+4}
+
+#--------------------------------------------------------------------------
+# Section 9: Deeply nested CTE
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-9.1 {
+  WITH
+    a AS (SELECT 1 as v),
+    b AS (SELECT v + 1 as v FROM a),
+    c AS (SELECT v + 1 as v FROM b),
+    d AS (SELECT v + 1 as v FROM c),
+    e AS (SELECT v + 1 as v FROM d)
+  SELECT v FROM e;
+} {5}
+
+#--------------------------------------------------------------------------
+# Section 10: CTE with subquery in WHERE
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-10.1 {
+  CREATE TABLE nums(n INTEGER);
+  INSERT INTO nums VALUES(2), (4), (6), (8);
+
+  WITH evens AS (SELECT * FROM nums)
+  SELECT n FROM evens WHERE n > (SELECT min(n) FROM evens);
+} {4
+6
+8}
+
+#--------------------------------------------------------------------------
+# Section 11: Recursive CTE with string operations
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-11.1 {
+  WITH RECURSIVE
+    chars(c, rest) AS (
+      SELECT substr('hello', 1, 1), substr('hello', 2)
+      UNION ALL
+      SELECT substr(rest, 1, 1), substr(rest, 2) FROM chars WHERE length(rest) > 0
+    )
+  SELECT c FROM chars;
+} {h
+e
+l
+l
+o}
+
+#--------------------------------------------------------------------------
+# Section 12: CTE used in DELETE statement
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-12.1 {
+  CREATE TABLE data(val INTEGER);
+  INSERT INTO data VALUES(1), (2), (3), (4), (5);
+
+  WITH to_delete AS (SELECT val FROM data WHERE val > 3)
+  DELETE FROM data WHERE val IN (SELECT val FROM to_delete);
+  SELECT * FROM data;
+} {1
+2
+3}
+
+#--------------------------------------------------------------------------
+# Section 13: CTE used in UPDATE statement
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-13.1 {
+  CREATE TABLE data(id INTEGER PRIMARY KEY, val INTEGER);
+  INSERT INTO data VALUES(1, 10), (2, 20), (3, 30);
+
+  WITH multiplier AS (SELECT 2 as m)
+  UPDATE data SET val = val * (SELECT m FROM multiplier) WHERE id = 2;
+  SELECT * FROM data ORDER BY id;
+} {1|10
+2|40
+3|30}
+
+#--------------------------------------------------------------------------
+# Section 14: Recursive CTE generating dates (simulated)
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-14.1 {
+  WITH RECURSIVE dates(d) AS (
+    SELECT 1
+    UNION ALL
+    SELECT d + 1 FROM dates WHERE d < 7
+  )
+  SELECT d,
+         CASE (d % 7)
+           WHEN 0 THEN 'Sun'
+           WHEN 1 THEN 'Mon'
+           WHEN 2 THEN 'Tue'
+           WHEN 3 THEN 'Wed'
+           WHEN 4 THEN 'Thu'
+           WHEN 5 THEN 'Fri'
+           WHEN 6 THEN 'Sat'
+         END as day
+  FROM dates;
+} {1|Mon
+2|Tue
+3|Wed
+4|Thu
+5|Fri
+6|Sat
+7|Sun}
+
+#--------------------------------------------------------------------------
+# Section 15: CTE with DISTINCT
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-15.1 {
+  CREATE TABLE dups(x INTEGER);
+  INSERT INTO dups VALUES(1), (2), (2), (3), (3), (3);
+
+  WITH unique_vals AS (SELECT DISTINCT x FROM dups)
+  SELECT * FROM unique_vals ORDER BY x;
+} {1
+2
+3}
+
+#--------------------------------------------------------------------------
+# Section 16: Recursive CTE with GROUP BY in outer query
+#--------------------------------------------------------------------------
+
+do_execsql_test_on_specific_db {:memory:} with3-16.1 {
+  WITH RECURSIVE cnt(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x + 1 FROM cnt WHERE x < 10
+  )
+  SELECT x % 3 as bucket, count(*) as cnt FROM cnt GROUP BY bucket ORDER BY bucket;
+} {0|3
+1|4
+2|3}
+
+puts "with3.test completed"

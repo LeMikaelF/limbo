@@ -1012,7 +1012,7 @@ pub enum Operation {
 
 impl Operation {
     pub fn default_scan_for(table: &Table) -> Self {
-        match table {
+        let result = match table {
             Table::BTree(_) => Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
                 index: None,
@@ -1023,7 +1023,9 @@ impl Operation {
                 constraints: Vec::new(),
             }),
             Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery),
-        }
+            Table::RecursiveCte(_) => Operation::Scan(Scan::RecursiveCte),
+        };
+        result
     }
 
     pub fn index(&self) -> Option<&Arc<Index>> {
@@ -1054,18 +1056,27 @@ impl JoinedTable {
     }
 
     /// Creates a new TableReference for a subquery.
+    /// If `explicit_column_names` is provided, those names will be used instead of
+    /// deriving them from the result columns. This is used for CTEs with column specifications
+    /// like `WITH cte(col1, col2) AS (...)`.
     pub fn new_subquery(
         identifier: String,
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
+        explicit_column_names: Option<Vec<String>>,
     ) -> Result<Self> {
         let mut columns = plan
             .result_columns
             .iter()
-            .map(|rc| {
+            .enumerate()
+            .map(|(i, rc)| {
+                let col_name = explicit_column_names
+                    .as_ref()
+                    .and_then(|names| names.get(i).cloned())
+                    .or_else(|| rc.name(&plan.table_references).map(String::from));
                 Column::new(
-                    rc.name(&plan.table_references).map(String::from),
+                    col_name,
                     "BLOB".to_string(),
                     None,
                     Type::Blob, // FIXME: infer proper type
@@ -1264,6 +1275,17 @@ impl JoinedTable {
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::FromClauseSubquery(..) => Ok((None, None)),
+            Table::RecursiveCte(_) => {
+                // For recursive CTEs, we use an ephemeral table cursor
+                // The cursor may have been opened by emit_recursive_cte already
+                let table_cursor_id = Some(
+                    program.alloc_cursor_id_keyed_if_not_exists(
+                        CursorKey::table(self.internal_id),
+                        CursorType::Sorter, // Using Sorter as a placeholder for ephemeral tables
+                    ),
+                );
+                Ok((table_cursor_id, None))
+            }
         }
     }
 
@@ -1482,18 +1504,20 @@ pub enum Scan {
         /// The index that we are using to scan the table, if any.
         index: Option<Arc<Index>>,
     },
-    /// A scan of a virtual table, delegated to the table’s `filter` and related methods.
+    /// A scan of a virtual table, delegated to the table's `filter` and related methods.
     VirtualTable {
         /// Index identifier returned by the table's `best_index` method.
         idx_num: i32,
-        /// Optional index name returned by the table’s `best_index` method.
+        /// Optional index name returned by the table's `best_index` method.
         idx_str: Option<String>,
-        /// Constraining expressions to be passed to the table’s `filter` method.
+        /// Constraining expressions to be passed to the table's `filter` method.
         /// The order of expressions matches the argument order expected by the virtual table.
         constraints: Vec<Expr>,
     },
     /// A scan of a subquery in the `FROM` clause.
     Subquery,
+    /// A scan of a recursive CTE's output table.
+    RecursiveCte,
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index

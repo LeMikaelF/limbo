@@ -728,6 +728,29 @@ pub fn open_loop(
                             end_offset: loop_end,
                         });
                     }
+                    (Scan::RecursiveCte, Table::RecursiveCte(_)) => {
+                        // Recursive CTEs have their output already materialized in an ephemeral table.
+                        // The cursor was opened and populated by emit_recursive_cte.
+                        // We just need to rewind and iterate over it.
+                        let cursor_id = table_cursor_id
+                            .expect("Recursive CTE must have a cursor allocated");
+                        program.emit_insn(Insn::Rewind {
+                            cursor_id,
+                            pc_if_empty: loop_end,
+                        });
+                        program.preassign_label_to_next_insn(loop_start);
+                    }
+                    (Scan::Subquery, Table::RecursiveCte(_)) => {
+                        // Fallback for recursive CTEs with Subquery scan type
+                        // (may happen if optimizer doesn't correctly set the scan type)
+                        let cursor_id = table_cursor_id
+                            .expect("Recursive CTE must have a cursor allocated");
+                        program.emit_insn(Insn::Rewind {
+                            cursor_id,
+                            pc_if_empty: loop_end,
+                        });
+                        program.preassign_label_to_next_insn(loop_start);
+                    }
                     _ => unreachable!(
                         "{:?} scan cannot be used with {:?} table",
                         scan, table.table
@@ -1443,13 +1466,21 @@ pub fn close_loop(
                             target_pc: loop_labels.loop_start,
                         });
                     }
+                    Scan::RecursiveCte => {
+                        // For recursive CTEs, we iterate through the output ephemeral table
+                        let cursor_id = table_cursor_id.expect("Recursive CTE cursor must be opened");
+                        program.emit_insn(Insn::Next {
+                            cursor_id,
+                            pc_if_next: loop_labels.loop_start,
+                        });
+                    }
                 }
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
             Operation::Search(search) => {
                 assert!(
-                    !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "Subqueries do not support index seeks"
+                    !matches!(table.table, Table::FromClauseSubquery(_) | Table::RecursiveCte(_)),
+                    "Subqueries and recursive CTEs do not support index seeks"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
                 let iteration_cursor_id =
