@@ -2320,6 +2320,12 @@ pub fn translate_expr(
                     });
                     Ok(target_register)
                 }
+                Table::RecursiveCte(_) => {
+                    // For recursive CTEs, we read from the output ephemeral table cursor
+                    let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
+                    program.emit_column_or_rowid(cursor_id, *column, target_register);
+                    Ok(target_register)
+                }
             }
         }
         ast::Expr::RowId {

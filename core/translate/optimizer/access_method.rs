@@ -62,6 +62,7 @@ pub enum AccessMethodParams {
         constraint_usages: Vec<ConstraintUsage>,
     },
     Subquery,
+    RecursiveCte,
     HashJoin {
         /// The table to build the hash table from.
         build_table_idx: usize,
@@ -103,6 +104,10 @@ pub fn find_best_access_method_for_join_order(
         Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
             params: AccessMethodParams::Subquery,
+        })),
+        Table::RecursiveCte(_) => Ok(Some(AccessMethod {
+            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
+            params: AccessMethodParams::RecursiveCte,
         })),
     }
 }

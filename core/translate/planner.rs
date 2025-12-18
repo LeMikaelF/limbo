@@ -32,8 +32,67 @@ use crate::{
 };
 use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, TableInternalId, With,
+    self, As, CommonTableExpr, CompoundOperator, Expr, FromClause, JoinType, Materialized,
+    OneSelect, Over, QualifiedName, Select, SelectBody, SelectTable, TableInternalId, With,
 };
+
+/// Checks if a SELECT statement references a table with the given name in its FROM clause.
+/// This is used to detect recursive CTEs - a CTE is recursive if it references itself.
+fn select_references_table(select: &Select, table_name: &str) -> bool {
+    select_body_references_table(&select.body, table_name)
+}
+
+fn select_body_references_table(body: &SelectBody, table_name: &str) -> bool {
+    if one_select_references_table(&body.select, table_name) {
+        return true;
+    }
+    for compound in &body.compounds {
+        if one_select_references_table(&compound.select, table_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn one_select_references_table(one_select: &OneSelect, table_name: &str) -> bool {
+    match one_select {
+        OneSelect::Select { from, .. } => {
+            if let Some(from_clause) = from {
+                from_clause_references_table(from_clause, table_name)
+            } else {
+                false
+            }
+        }
+        OneSelect::Values(_) => false,
+    }
+}
+
+fn from_clause_references_table(from: &FromClause, table_name: &str) -> bool {
+    if select_table_references_table(&from.select, table_name) {
+        return true;
+    }
+    for join in &from.joins {
+        if select_table_references_table(&join.table, table_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn select_table_references_table(select_table: &SelectTable, table_name: &str) -> bool {
+    match select_table {
+        SelectTable::Table(qualified_name, _, _) => {
+            let name = normalize_ident(qualified_name.name.as_str());
+            name == table_name
+        }
+        SelectTable::TableCall(qualified_name, _, _) => {
+            let name = normalize_ident(qualified_name.name.as_str());
+            name == table_name
+        }
+        SelectTable::Select(inner_select, _) => select_references_table(inner_select, table_name),
+        SelectTable::Sub(inner_from, _) => from_clause_references_table(inner_from, table_name),
+    }
+}
 
 /// Valid ways to refer to the rowid of a btree table.
 pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
@@ -352,6 +411,7 @@ fn parse_from_clause_table(
                 subplan,
                 None,
                 program.table_reference_counter.next(),
+                None, // No explicit column names for regular subqueries
             )?);
             Ok(())
         }
@@ -368,6 +428,42 @@ fn parse_from_clause_table(
         ),
         _ => todo!(),
     }
+}
+
+/// Validates that the explicit column count matches the actual column count for a CTE.
+/// This implements SQLite's lazy validation behavior - validation happens when the CTE is used,
+/// not when it's defined.
+fn validate_cte_column_count(table: &Table) -> Result<()> {
+    match table {
+        Table::FromClauseSubquery(subquery) => {
+            if let Some(explicit_count) = subquery.explicit_column_count {
+                let actual_count = subquery.columns.len();
+                if explicit_count != actual_count {
+                    crate::bail_parse_error!(
+                        "table {} has {} values for {} columns",
+                        subquery.name,
+                        actual_count,
+                        explicit_count
+                    );
+                }
+            }
+        }
+        Table::RecursiveCte(cte) => {
+            if let Some(explicit_count) = cte.explicit_column_count {
+                let actual_count = cte.columns.len();
+                if explicit_count != actual_count {
+                    crate::bail_parse_error!(
+                        "table {} has {} values for {} columns",
+                        cte.name,
+                        actual_count,
+                        explicit_count
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -387,12 +483,17 @@ fn parse_table(
     let table_name = &qualified_name.name;
 
     // Check if the FROM clause table is referring to a CTE in the current scope.
-    if let Some(cte_idx) = ctes
+    if let Some(cte) = ctes
         .iter()
-        .position(|cte| cte.identifier == normalized_qualified_name)
+        .find(|cte| cte.identifier == normalized_qualified_name)
     {
-        // TODO: what if the CTE is referenced multiple times?
-        let mut cte_table = ctes.remove(cte_idx);
+        // Clone the CTE so it can be referenced multiple times in the same query
+        let mut cte_table = cte.clone();
+        // Generate a new internal_id for this reference to avoid conflicts
+        cte_table.internal_id = program.table_reference_counter.next();
+
+        // Perform lazy column count validation (SQLite only validates when CTE is used)
+        validate_cte_column_count(&cte_table.table)?;
 
         // If there's an alias provided, update the identifier to use that alias
         if let Some(a) = maybe_alias {
@@ -406,6 +507,36 @@ fn parse_table(
         table_references.add_joined_table(cte_table);
         return Ok(());
     };
+
+    // Check if the table is a CTE from an outer scope (e.g., a recursive CTE referenced by a non-recursive CTE)
+    if let Some(outer_ref) = table_references
+        .outer_query_refs()
+        .iter()
+        .find(|r| r.identifier == normalized_qualified_name)
+    {
+        // Perform lazy column count validation (SQLite only validates when CTE is used)
+        validate_cte_column_count(&outer_ref.table)?;
+
+        let identifier = maybe_alias
+            .map(|a| match a {
+                ast::As::As(id) => normalize_ident(id.as_str()),
+                ast::As::Elided(id) => normalize_ident(id.as_str()),
+            })
+            .unwrap_or_else(|| normalized_qualified_name.clone());
+
+        table_references.add_joined_table(JoinedTable {
+            op: Operation::default_scan_for(&outer_ref.table),
+            table: outer_ref.table.clone(),
+            identifier,
+            internal_id: program.table_reference_counter.next(),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+        });
+        return Ok(());
+    }
 
     // Resolve table using connection's with_schema method
     let table = connection.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
@@ -630,6 +761,351 @@ fn transform_args_into_where_terms(
     Ok(())
 }
 
+/// Parse and validate a recursive CTE.
+/// A recursive CTE must have:
+/// 1. UNION ALL structure
+/// 2. An anchor term that does NOT reference the CTE
+/// 3. A recursive term that references the CTE exactly once
+///
+/// Returns a JoinedTable for the main query to reference.
+fn parse_recursive_cte(
+    cte: turso_parser::ast::CommonTableExpr,
+    cte_name: &str,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    ctes_as_subqueries: &[JoinedTable],
+    connection: &Arc<crate::Connection>,
+) -> Result<JoinedTable> {
+    use crate::schema::{ColDef, Column, RecursiveCte, Type};
+
+    let select = cte.select;
+    let body = select.body;
+
+    // Recursive CTEs must have a UNION ALL structure.
+    // A self-referencing CTE without UNION ALL is a circular reference error.
+    if body.compounds.is_empty() {
+        crate::bail_parse_error!("circular reference: {}", cte.tbl_name.as_str());
+    }
+
+    // For simplicity, we handle the case of exactly one compound (UNION ALL)
+    // More complex recursive CTEs with multiple unions can be added later
+    if body.compounds.len() > 1 {
+        crate::bail_parse_error!(
+            "recursive CTE {} with multiple compound operators is not yet supported",
+            cte.tbl_name.as_str()
+        );
+    }
+
+    let compound = &body.compounds[0];
+    if compound.operator != CompoundOperator::UnionAll {
+        crate::bail_parse_error!(
+            "recursive CTE {} requires UNION ALL (UNION is not supported)",
+            cte.tbl_name.as_str()
+        );
+    }
+
+    // Determine which part is anchor and which is recursive
+    // The anchor must NOT reference the CTE; the recursive member must reference it
+    let first_refs_cte = one_select_references_table(&body.select, cte_name);
+    let second_refs_cte = one_select_references_table(&compound.select, cte_name);
+
+    let (anchor, recursive_member) = if !first_refs_cte && second_refs_cte {
+        // Normal case: first is anchor, second is recursive
+        (body.select.clone(), compound.select.clone())
+    } else if first_refs_cte && !second_refs_cte {
+        // Reversed case: second is anchor, first is recursive
+        (compound.select.clone(), body.select.clone())
+    } else if first_refs_cte && second_refs_cte {
+        crate::bail_parse_error!(
+            "recursive CTE {} has multiple recursive references",
+            cte.tbl_name.as_str()
+        );
+    } else {
+        crate::bail_parse_error!(
+            "recursive CTE {} is marked recursive but has no self-reference",
+            cte.tbl_name.as_str()
+        );
+    };
+
+    // Check for recursive reference in subqueries (not allowed)
+    if recursive_member_has_recursive_ref_in_subquery(&recursive_member, cte_name) {
+        crate::bail_parse_error!(
+            "circular reference: {}",
+            cte.tbl_name.as_str()
+        );
+    }
+
+    // Check for multiple recursive references in FROM clause
+    if count_recursive_refs_in_from(&recursive_member, cte_name) > 1 {
+        crate::bail_parse_error!(
+            "multiple recursive references: {}",
+            cte.tbl_name.as_str()
+        );
+    }
+
+    // Convert anchor OneSelect to a full Select so we can prepare a plan
+    let anchor_select = Select {
+        with: None,
+        body: SelectBody {
+            select: anchor.clone(),
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    };
+
+    // Prepare outer query refs for the anchor (can reference prior CTEs)
+    let mut outer_query_refs_for_anchor = table_references.outer_query_refs().to_vec();
+    outer_query_refs_for_anchor.extend(ctes_as_subqueries.iter().map(|t: &JoinedTable| {
+        OuterQueryReference {
+            identifier: t.identifier.clone(),
+            internal_id: t.internal_id,
+            table: t.table.clone(),
+            col_used_mask: ColumnUsedMask::default(),
+        }
+    }));
+
+    // Prepare plan for anchor to get column information
+    let anchor_plan = prepare_select_plan(
+        anchor_select,
+        resolver,
+        program,
+        &outer_query_refs_for_anchor,
+        QueryDestination::placeholder_for_subquery(),
+        connection,
+    )?;
+    let Plan::Select(anchor_plan) = anchor_plan else {
+        crate::bail_parse_error!("Anchor of recursive CTE must be a SELECT query");
+    };
+
+    // Determine column names from explicit specification or anchor result columns.
+    // Note: Column count validation is deferred until the CTE is actually used,
+    // matching SQLite's lazy validation behavior.
+    let (explicit_column_names, explicit_column_count): (Vec<String>, Option<usize>) =
+        if !cte.columns.is_empty() {
+            let names: Vec<String> = cte
+                .columns
+                .iter()
+                .map(|col| normalize_ident(col.col_name.as_str()))
+                .collect();
+            let count = names.len();
+            (names, Some(count))
+        } else {
+            // Infer column names from anchor result columns
+            let names: Vec<String> = anchor_plan
+                .result_columns
+                .iter()
+                .enumerate()
+                .map(|(i, rc)| {
+                    rc.name(&anchor_plan.table_references)
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("column{}", i))
+                })
+                .collect();
+            (names, None)
+        };
+
+    // Validate that recursive member has the same number of columns as anchor
+    let recursive_member_column_count = match &recursive_member {
+        OneSelect::Select { columns, .. } => columns.len(),
+        OneSelect::Values(rows) => rows.first().map(|r| r.len()).unwrap_or(0),
+    };
+    let anchor_column_count = anchor_plan.result_columns.len();
+    if recursive_member_column_count != anchor_column_count {
+        crate::bail_parse_error!(
+            "SELECTs to the left and right of UNION ALL do not have the same number of result columns"
+        );
+    }
+
+    // Create columns for the recursive CTE table
+    let columns: Vec<Column> = explicit_column_names
+        .iter()
+        .map(|name| {
+            Column::new(
+                Some(name.clone()),
+                "BLOB".to_string(),
+                None,
+                Type::Blob, // We use BLOB as a generic type
+                None,
+                ColDef::default(),
+            )
+        })
+        .collect();
+
+    // Create the RecursiveCte table with the pre-planned anchor
+    let recursive_cte_table = Table::RecursiveCte(RecursiveCte {
+        name: cte_name.to_string(),
+        columns: columns.clone(),
+        anchor: anchor.clone(),
+        recursive_member: recursive_member.clone(),
+        anchor_plan: Some(Box::new(anchor_plan)),
+        explicit_column_count,
+    });
+
+    let internal_id = program.table_reference_counter.next();
+
+    // Create the JoinedTable
+    Ok(JoinedTable {
+        op: Operation::default_scan_for(&recursive_cte_table),
+        table: recursive_cte_table,
+        identifier: cte_name.to_string(),
+        internal_id,
+        join_info: None,
+        col_used_mask: ColumnUsedMask::default(),
+        column_use_counts: Vec::new(),
+        expression_index_usages: Vec::new(),
+        database_id: 0,
+    })
+}
+
+/// Check if a OneSelect has a recursive reference in a subquery (which is not allowed)
+fn recursive_member_has_recursive_ref_in_subquery(one_select: &OneSelect, cte_name: &str) -> bool {
+    match one_select {
+        OneSelect::Select { where_clause, .. } => {
+            // Check WHERE clause for subqueries that reference the CTE
+            if let Some(expr) = where_clause {
+                if expr_has_cte_in_subquery(expr, cte_name) {
+                    return true;
+                }
+            }
+            false
+        }
+        OneSelect::Values(_) => false,
+    }
+}
+
+/// Check if an expression contains a subquery that references the CTE
+fn expr_has_cte_in_subquery(expr: &Expr, cte_name: &str) -> bool {
+    match expr {
+        Expr::InSelect { rhs, .. } => {
+            if select_references_table(rhs, cte_name) {
+                return true;
+            }
+        }
+        Expr::Subquery(select) => {
+            if select_references_table(select, cte_name) {
+                return true;
+            }
+        }
+        Expr::Exists(select) => {
+            if select_references_table(select, cte_name) {
+                return true;
+            }
+        }
+        Expr::Binary(left, _, right) => {
+            if expr_has_cte_in_subquery(left, cte_name)
+                || expr_has_cte_in_subquery(right, cte_name)
+            {
+                return true;
+            }
+        }
+        Expr::Unary(_, inner) => {
+            if expr_has_cte_in_subquery(inner, cte_name) {
+                return true;
+            }
+        }
+        Expr::Between { lhs, start, end, .. } => {
+            if expr_has_cte_in_subquery(lhs, cte_name)
+                || expr_has_cte_in_subquery(start, cte_name)
+                || expr_has_cte_in_subquery(end, cte_name)
+            {
+                return true;
+            }
+        }
+        Expr::Case { base, when_then_pairs, else_expr, .. } => {
+            if let Some(op) = base {
+                if expr_has_cte_in_subquery(op, cte_name) {
+                    return true;
+                }
+            }
+            for (when_expr, then_expr) in when_then_pairs {
+                if expr_has_cte_in_subquery(when_expr, cte_name)
+                    || expr_has_cte_in_subquery(then_expr, cte_name)
+                {
+                    return true;
+                }
+            }
+            if let Some(else_e) = else_expr {
+                if expr_has_cte_in_subquery(else_e, cte_name) {
+                    return true;
+                }
+            }
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            if expr_has_cte_in_subquery(lhs, cte_name) {
+                return true;
+            }
+            for item in rhs {
+                if expr_has_cte_in_subquery(item, cte_name) {
+                    return true;
+                }
+            }
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                if expr_has_cte_in_subquery(arg, cte_name) {
+                    return true;
+                }
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            if expr_has_cte_in_subquery(expr, cte_name) {
+                return true;
+            }
+        }
+        Expr::Parenthesized(inner) => {
+            for e in inner {
+                if expr_has_cte_in_subquery(e, cte_name) {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Count how many times the CTE is referenced in the FROM clause
+fn count_recursive_refs_in_from(one_select: &OneSelect, cte_name: &str) -> usize {
+    match one_select {
+        OneSelect::Select { from, .. } => {
+            if let Some(from_clause) = from {
+                count_refs_in_from_clause(from_clause, cte_name)
+            } else {
+                0
+            }
+        }
+        OneSelect::Values(_) => 0,
+    }
+}
+
+fn count_refs_in_from_clause(from: &FromClause, cte_name: &str) -> usize {
+    let mut count = count_refs_in_select_table(&from.select, cte_name);
+    for join in &from.joins {
+        count += count_refs_in_select_table(&join.table, cte_name);
+    }
+    count
+}
+
+fn count_refs_in_select_table(select_table: &SelectTable, cte_name: &str) -> usize {
+    match select_table {
+        SelectTable::Table(qualified_name, _, _) => {
+            let name = normalize_ident(qualified_name.name.as_str());
+            if name == cte_name { 1 } else { 0 }
+        }
+        SelectTable::TableCall(qualified_name, _, _) => {
+            let name = normalize_ident(qualified_name.name.as_str());
+            if name == cte_name { 1 } else { 0 }
+        }
+        SelectTable::Select(_, _) => {
+            // Subqueries don't count as FROM clause references for this check
+            0
+        }
+        SelectTable::Sub(inner_from, _) => count_refs_in_from_clause(inner_from, cte_name),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn parse_from(
     mut from: Option<FromClause>,
@@ -641,84 +1117,173 @@ pub fn parse_from(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    if from.is_none() {
-        return Ok(());
-    }
-
     let mut ctes_as_subqueries: Vec<JoinedTable> = vec![];
 
     if let Some(with) = with {
-        if with.recursive {
-            crate::bail_parse_error!("Recursive CTEs are not yet supported");
-        }
+        // Note: The RECURSIVE keyword is informational only in our implementation.
+        // SQLite allows self-referencing CTEs even without RECURSIVE keyword,
+        // as long as they have a proper UNION ALL structure.
+        let _is_recursive_with = with.recursive;
 
-        for cte in with.ctes {
+        // Collect CTE names and check for conflicts
+        let mut all_cte_names: Vec<String> = Vec::with_capacity(with.ctes.len());
+        for cte in &with.ctes {
             if cte.materialized == Materialized::Yes {
                 crate::bail_parse_error!("Materialized CTEs are not yet supported");
             }
-            if !cte.columns.is_empty() {
-                crate::bail_parse_error!("CTE columns are not yet supported");
-            }
-
-            // Check if normalized name conflicts with catalog tables or other CTEs
-            // TODO: sqlite actually allows overriding a catalog table with a CTE.
-            // We should carry over the 'Scope' struct to all of our identifier resolution.
             let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
-            if ctes_as_subqueries
-                .iter()
-                .any(|t| t.table.get_name() == cte_name_normalized)
-            {
+            if all_cte_names.contains(&cte_name_normalized) {
                 crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
             }
-
             if resolver.schema.get_table(&cte_name_normalized).is_some() {
                 crate::bail_parse_error!(
                     "CTE name {} conflicts with catalog table name",
                     cte.tbl_name.as_str()
                 );
             }
-            if table_references
-                .outer_query_refs()
-                .iter()
-                .any(|t| t.identifier == cte_name_normalized)
-            {
-                crate::bail_parse_error!(
-                    "CTE name {} conflicts with WITH table name {}",
-                    cte.tbl_name.as_str(),
-                    cte_name_normalized
-                );
+            all_cte_names.push(cte_name_normalized);
+        }
+
+        // Process CTEs with demand-driven forward reference resolution.
+        // CTEs can reference sibling CTEs defined later in the same WITH clause.
+        // We use an iterative approach: keep processing CTEs until all are done or
+        // we detect a circular dependency.
+        let mut pending_ctes: Vec<CommonTableExpr> = with.ctes;
+
+        while !pending_ctes.is_empty() {
+            let initial_count = pending_ctes.len();
+            let mut still_pending = Vec::new();
+
+            for cte in pending_ctes {
+                let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
+
+                // Check if this CTE references itself.
+                // SQLite allows self-referencing CTEs even without the RECURSIVE keyword,
+                // as long as they have a proper UNION ALL structure with an anchor.
+                // The parse_recursive_cte function will validate the structure.
+                let cte_is_self_referencing =
+                    select_references_table(&cte.select, &cte_name_normalized);
+
+                // Check which sibling CTEs this CTE depends on
+                let sibling_deps: Vec<&str> = all_cte_names
+                    .iter()
+                    .filter(|name| {
+                        *name != &cte_name_normalized
+                            && select_references_table(&cte.select, name)
+                    })
+                    .map(|s| s.as_str())
+                    .collect();
+
+                // Check if all sibling dependencies are already processed
+                let all_deps_resolved = sibling_deps.iter().all(|dep| {
+                    ctes_as_subqueries
+                        .iter()
+                        .any(|t| t.table.get_name() == *dep)
+                });
+
+                if !all_deps_resolved {
+                    // Defer processing - dependencies not ready yet
+                    still_pending.push(cte);
+                    continue;
+                }
+
+                if cte_is_self_referencing {
+                    // Parse and validate the recursive CTE
+                    let joined_table = parse_recursive_cte(
+                        cte,
+                        &cte_name_normalized,
+                        resolver,
+                        program,
+                        table_references,
+                        &ctes_as_subqueries,
+                        connection,
+                    )?;
+                    ctes_as_subqueries.push(joined_table);
+                } else {
+                    // Non-recursive CTE
+                    let mut outer_query_refs_for_cte = table_references.outer_query_refs().to_vec();
+                    outer_query_refs_for_cte.extend(ctes_as_subqueries.iter().map(
+                        |t: &JoinedTable| OuterQueryReference {
+                            identifier: t.identifier.clone(),
+                            internal_id: t.internal_id,
+                            table: t.table.clone(),
+                            col_used_mask: ColumnUsedMask::default(),
+                        },
+                    ));
+
+                    let cte_plan = prepare_select_plan(
+                        cte.select,
+                        resolver,
+                        program,
+                        &outer_query_refs_for_cte,
+                        QueryDestination::placeholder_for_subquery(),
+                        connection,
+                    )?;
+
+                    // Column count validation is deferred until the CTE is used (SQLite behavior)
+                    let explicit_column_names = if !cte.columns.is_empty() {
+                        Some(
+                            cte.columns
+                                .iter()
+                                .map(|col| normalize_ident(col.col_name.as_str()))
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    };
+
+                    let joined_table = match cte_plan {
+                        Plan::Select(select_plan) => JoinedTable::new_subquery(
+                            cte_name_normalized,
+                            select_plan,
+                            None,
+                            program.table_reference_counter.next(),
+                            explicit_column_names,
+                        )?,
+                        Plan::CompoundSelect { .. } => JoinedTable::new_compound_subquery(
+                            cte_name_normalized,
+                            cte_plan,
+                            None,
+                            program.table_reference_counter.next(),
+                            explicit_column_names,
+                        )?,
+                        _ => {
+                            crate::bail_parse_error!(
+                                "Only SELECT queries are supported in CTEs, found: {:?}",
+                                cte_plan
+                            );
+                        }
+                    };
+
+                    ctes_as_subqueries.push(joined_table);
+                }
             }
 
-            let mut outer_query_refs_for_cte = table_references.outer_query_refs().to_vec();
-            outer_query_refs_for_cte.extend(ctes_as_subqueries.iter().map(|t: &JoinedTable| {
-                OuterQueryReference {
-                    identifier: t.identifier.clone(),
-                    internal_id: t.internal_id,
-                    table: t.table.clone(),
-                    col_used_mask: ColumnUsedMask::default(),
-                }
-            }));
+            pending_ctes = still_pending;
 
-            // CTE can refer to other CTEs that came before it, plus any schema tables or tables in the outer scope.
-            let cte_plan = prepare_select_plan(
-                cte.select,
-                resolver,
-                program,
-                &outer_query_refs_for_cte,
-                QueryDestination::placeholder_for_subquery(),
-                connection,
-            )?;
-            let Plan::Select(cte_plan) = cte_plan else {
-                crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
-            };
-
-            ctes_as_subqueries.push(JoinedTable::new_subquery(
-                cte_name_normalized,
-                cte_plan,
-                None,
-                program.table_reference_counter.next(),
-            )?);
+            // If no progress was made and there are still pending CTEs, we have a circular dependency
+            if pending_ctes.len() == initial_count && !pending_ctes.is_empty() {
+                let circular_names: Vec<&str> = pending_ctes
+                    .iter()
+                    .map(|c| c.tbl_name.as_str())
+                    .collect();
+                crate::bail_parse_error!("circular reference: {}", circular_names.join(", "));
+            }
         }
+    }
+
+    // If there's no FROM clause, but there are CTEs, add them to table_references
+    // so they're available for subqueries in result columns, etc.
+    if from.is_none() {
+        for cte in ctes_as_subqueries {
+            table_references.add_outer_query_reference(OuterQueryReference {
+                identifier: cte.identifier.clone(),
+                internal_id: cte.internal_id,
+                table: cte.table.clone(),
+                col_used_mask: ColumnUsedMask::default(),
+            });
+        }
+        return Ok(());
     }
 
     let from_owned = std::mem::take(&mut from).unwrap();

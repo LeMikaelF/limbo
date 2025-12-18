@@ -54,6 +54,7 @@ use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::Connection;
 use crate::{bail_parse_error, Result, SymbolTable};
 
+#[derive(Clone)]
 pub struct Resolver<'a> {
     pub schema: &'a Schema,
     pub symbol_table: &'a SymbolTable,

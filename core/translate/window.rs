@@ -224,6 +224,7 @@ fn prepare_window_subquery(
         inner_plan,
         None,
         subquery_id,
+        None, // No explicit column names for window subqueries
     )?;
 
     // Verify that the subquery has the expected database ID.

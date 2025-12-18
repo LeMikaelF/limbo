@@ -995,6 +995,7 @@ fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool>
             crate::schema::Table::BTree(tbl) => &tbl.name,
             crate::schema::Table::Virtual(tbl) => &tbl.name,
             crate::schema::Table::FromClauseSubquery(tbl) => &tbl.name,
+            crate::schema::Table::RecursiveCte(cte) => &cte.name,
         };
 
         if table_name != "sqlite_schema" {

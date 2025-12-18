@@ -346,7 +346,20 @@ fn add_ephemeral_table_to_update_plan(
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
-            optimize_select_plan(&mut from_clause_subquery.plan, schema)?;
+            match &mut from_clause_subquery.plan {
+                crate::schema::SubqueryPlan::Simple(select_plan) => {
+                    optimize_select_plan(select_plan, schema)?;
+                }
+                crate::schema::SubqueryPlan::Compound(compound_plan) => {
+                    // Optimize compound select plans
+                    if let crate::translate::plan::Plan::CompoundSelect { left, right_most, .. } = compound_plan.as_mut() {
+                        optimize_select_plan(right_most, schema)?;
+                        for (left_plan, _) in left.iter_mut() {
+                            optimize_select_plan(left_plan, schema)?;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1012,6 +1025,10 @@ fn optimize_table_access(
             AccessMethodParams::Subquery => {
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::Scan(Scan::Subquery);
+            }
+            AccessMethodParams::RecursiveCte => {
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::Scan(Scan::RecursiveCte);
             }
             AccessMethodParams::HashJoin {
                 build_table_idx,

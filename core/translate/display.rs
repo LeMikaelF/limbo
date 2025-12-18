@@ -119,7 +119,7 @@ impl Display for SelectPlan {
                                 writeln!(f, "{indent}SCAN {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery | Scan::RecursiveCte => {
                             writeln!(f, "{indent}SCAN {table_name}")?;
                         }
                     }
@@ -196,7 +196,7 @@ impl Display for DeletePlan {
                                 writeln!(f, "{indent}DELETE FROM {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery | Scan::RecursiveCte => {
                             writeln!(f, "{indent}DELETE FROM {table_name}")?;
                         }
                     }
@@ -282,7 +282,7 @@ impl fmt::Display for UpdatePlan {
                                 writeln!(f, "{indent}{action} {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery | Scan::RecursiveCte => {
                             if i == 0 {
                                 writeln!(f, "{indent}UPDATE {table_name}")?;
                             } else {
@@ -469,14 +469,32 @@ impl ToTokens for JoinedTable {
             Table::FromClauseSubquery(from_clause_subquery) => {
                 s.append(TokenType::TK_LP, None)?;
                 // Could possibly merge the contexts together here
-                from_clause_subquery.plan.to_tokens(
-                    s,
-                    &PlanContext(&[&from_clause_subquery.plan.table_references]),
-                )?;
+                match &from_clause_subquery.plan {
+                    crate::schema::SubqueryPlan::Simple(plan) => {
+                        plan.to_tokens(
+                            s,
+                            &PlanContext(&[&plan.table_references]),
+                        )?;
+                    }
+                    crate::schema::SubqueryPlan::Compound(_plan) => {
+                        // For compound selects, display a placeholder for now
+                        // TODO: implement proper compound select tokenization
+                        s.append(TokenType::TK_SELECT, None)?;
+                        s.append(TokenType::TK_STAR, None)?;
+                    }
+                }
                 s.append(TokenType::TK_RP, None)?;
 
                 s.append(TokenType::TK_AS, None)?;
                 s.append(TokenType::TK_ID, Some(&self.identifier))?;
+            }
+            Table::RecursiveCte(cte) => {
+                // Recursive CTEs are printed as their name (like a regular table reference)
+                s.append(TokenType::TK_ID, Some(&cte.name))?;
+                if self.identifier != cte.name {
+                    s.append(TokenType::TK_AS, None)?;
+                    s.append(TokenType::TK_ID, Some(&self.identifier))?;
+                }
             }
         };
 
