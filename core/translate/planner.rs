@@ -467,6 +467,33 @@ fn parse_table(
         return Ok(());
     };
 
+    // Check if the table is a CTE from an outer scope (e.g., a recursive CTE referenced by a non-recursive CTE)
+    if let Some(outer_ref) = table_references
+        .outer_query_refs()
+        .iter()
+        .find(|r| r.identifier == normalized_qualified_name)
+    {
+        let identifier = maybe_alias
+            .map(|a| match a {
+                ast::As::As(id) => normalize_ident(id.as_str()),
+                ast::As::Elided(id) => normalize_ident(id.as_str()),
+            })
+            .unwrap_or_else(|| normalized_qualified_name.clone());
+
+        table_references.add_joined_table(JoinedTable {
+            op: Operation::default_scan_for(&outer_ref.table),
+            table: outer_ref.table.clone(),
+            identifier,
+            internal_id: program.table_reference_counter.next(),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+        });
+        return Ok(());
+    }
+
     // Resolve table using connection's with_schema method
     let table = connection.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 

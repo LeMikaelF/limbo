@@ -232,16 +232,15 @@ do_execsql_test_on_specific_db {:memory:} with1-6.3 {
 # } {.*circular reference.*}
 
 # Multiple recursive references (not allowed)
-# TODO: Enable when multiple recursive reference detection is implemented
-# do_execsql_test_error with1-7.5 {
-#   CREATE TABLE tree(i INTEGER, p INTEGER);
-#   WITH RECURSIVE t(id) AS (
-#     SELECT 2
-#     UNION ALL
-#     SELECT i FROM tree, t, t AS t2 WHERE p = t.id
-#   )
-#   SELECT id FROM t;
-# } {.*multiple.*recursive.*}
+do_execsql_test_error with1-7.5 {
+  CREATE TABLE tree(i INTEGER, p INTEGER);
+  WITH RECURSIVE t(id) AS (
+    SELECT 2
+    UNION ALL
+    SELECT i FROM tree, t, t AS t2 WHERE p = t.id
+  )
+  SELECT id FROM t;
+} {.*multiple.*recursive.*}
 
 #--------------------------------------------------------------------------
 # Section 8: Column count mismatch errors
@@ -333,17 +332,17 @@ do_execsql_test_on_specific_db {:memory:} with1-fib.1 {
 # Section 12: Multiple CTEs with recursive
 #--------------------------------------------------------------------------
 
-# TODO: Enable when non-recursive CTE can reference recursive CTE in same WITH block
-# do_execsql_test_on_specific_db {:memory:} with1-multi.1 {
-#   WITH RECURSIVE
-#     cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5),
-#     doubled(y) AS (SELECT x*2 FROM cnt)
-#   SELECT y FROM doubled;
-# } {2
-# 4
-# 6
-# 8
-# 10}
+# Non-recursive CTE referencing recursive CTE in same WITH block
+do_execsql_test_on_specific_db {:memory:} with1-multi.1 {
+  WITH RECURSIVE
+    cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5),
+    doubled(y) AS (SELECT x*2 FROM cnt)
+  SELECT y FROM doubled;
+} {2
+4
+6
+8
+10}
 
 #--------------------------------------------------------------------------
 # Section 13: Non-recursive CTE in WITH RECURSIVE block
