@@ -867,12 +867,13 @@ fn parse_recursive_cte(
         })
         .collect();
 
-    // Create the RecursiveCte table
+    // Create the RecursiveCte table with the pre-planned anchor
     let recursive_cte_table = Table::RecursiveCte(RecursiveCte {
         name: cte_name.to_string(),
         columns: columns.clone(),
         anchor: anchor.clone(),
         recursive_member: recursive_member.clone(),
+        anchor_plan: Some(Box::new(anchor_plan)),
     });
 
     let internal_id = program.table_reference_counter.next();

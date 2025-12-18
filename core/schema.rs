@@ -1403,6 +1403,8 @@ pub struct RecursiveCte {
     pub anchor: turso_parser::ast::OneSelect,
     /// The recursive member query AST - references the CTE.
     pub recursive_member: turso_parser::ast::OneSelect,
+    /// Pre-planned anchor query - set during query planning.
+    pub anchor_plan: Option<Box<crate::translate::plan::SelectPlan>>,
 }
 
 impl Table {

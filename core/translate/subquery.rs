@@ -19,7 +19,7 @@ use crate::{
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::Insn,
-        CursorID,
+        BranchOffset, CursorID,
     },
     Connection, QueryMode, Result,
 };
@@ -27,7 +27,7 @@ use crate::{
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Operation, QueryDestination, Scan, Search, SelectPlan, TableReferences},
+    plan::{JoinedTable, Operation, QueryDestination, Scan, Search, SelectPlan, TableReferences},
 };
 
 /// Maximum recursion depth for recursive CTEs to prevent infinite loops.
@@ -761,6 +761,114 @@ fn bind_cte_columns_in_expr(
     }
 }
 
+/// Helper function to bind table column references in expressions.
+/// This converts Expr::Id and Expr::Qualified that reference columns of known tables
+/// into Expr::Column with the appropriate internal_id and column index.
+fn bind_table_columns_in_expr(
+    expr: &mut ast::Expr,
+    tables: &[(&str, ast::TableInternalId, &crate::schema::BTreeTable)],
+) {
+    use crate::util::normalize_ident;
+
+    match expr {
+        ast::Expr::Id(name) => {
+            // Try to find this column in any of the tables
+            let normalized = normalize_ident(name.as_str());
+            for (_, internal_id, btree_table) in tables {
+                if let Some(col_idx) = btree_table.columns.iter().position(|c| {
+                    c.name.as_ref().map(|n| n.eq_ignore_ascii_case(&normalized)).unwrap_or(false)
+                }) {
+                    let is_rowid_alias = btree_table.columns[col_idx].is_rowid_alias();
+                    *expr = ast::Expr::Column {
+                        database: None,
+                        table: *internal_id,
+                        column: col_idx,
+                        is_rowid_alias,
+                    };
+                    return;
+                }
+            }
+        }
+        ast::Expr::Qualified(table, name) => {
+            let table_normalized = normalize_ident(table.as_str());
+            let col_normalized = normalize_ident(name.as_str());
+            for (table_name, internal_id, btree_table) in tables {
+                if table_name.eq_ignore_ascii_case(&table_normalized) {
+                    if let Some(col_idx) = btree_table.columns.iter().position(|c| {
+                        c.name.as_ref().map(|n| n.eq_ignore_ascii_case(&col_normalized)).unwrap_or(false)
+                    }) {
+                        let is_rowid_alias = btree_table.columns[col_idx].is_rowid_alias();
+                        *expr = ast::Expr::Column {
+                            database: None,
+                            table: *internal_id,
+                            column: col_idx,
+                            is_rowid_alias,
+                        };
+                        return;
+                    }
+                }
+            }
+        }
+        // Recursive cases for compound expressions
+        ast::Expr::Binary(lhs, _, rhs) => {
+            bind_table_columns_in_expr(lhs, tables);
+            bind_table_columns_in_expr(rhs, tables);
+        }
+        ast::Expr::Unary(_, inner) => {
+            bind_table_columns_in_expr(inner, tables);
+        }
+        ast::Expr::Parenthesized(inner) => {
+            for e in inner {
+                bind_table_columns_in_expr(e, tables);
+            }
+        }
+        ast::Expr::Between { lhs, start, end, .. } => {
+            bind_table_columns_in_expr(lhs, tables);
+            bind_table_columns_in_expr(start, tables);
+            bind_table_columns_in_expr(end, tables);
+        }
+        ast::Expr::Case { base, when_then_pairs, else_expr, .. } => {
+            if let Some(op) = base {
+                bind_table_columns_in_expr(op, tables);
+            }
+            for (when, then) in when_then_pairs {
+                bind_table_columns_in_expr(when, tables);
+                bind_table_columns_in_expr(then, tables);
+            }
+            if let Some(else_e) = else_expr {
+                bind_table_columns_in_expr(else_e, tables);
+            }
+        }
+        ast::Expr::Cast { expr: inner, .. } => {
+            bind_table_columns_in_expr(inner, tables);
+        }
+        ast::Expr::Collate(inner, _) => {
+            bind_table_columns_in_expr(inner, tables);
+        }
+        ast::Expr::FunctionCall { args, filter_over, .. } => {
+            for arg in args {
+                bind_table_columns_in_expr(arg, tables);
+            }
+            if let Some(filter) = &mut filter_over.filter_clause {
+                bind_table_columns_in_expr(filter, tables);
+            }
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            bind_table_columns_in_expr(lhs, tables);
+            for e in rhs {
+                bind_table_columns_in_expr(e, tables);
+            }
+        }
+        ast::Expr::IsNull(inner) => {
+            bind_table_columns_in_expr(inner, tables);
+        }
+        ast::Expr::NotNull(inner) => {
+            bind_table_columns_in_expr(inner, tables);
+        }
+        _ => {}
+    }
+}
+
 /// Emit bytecode for a recursive CTE.
 ///
 /// Recursive CTE execution pattern:
@@ -831,81 +939,117 @@ pub fn emit_recursive_cte(
     let record_reg = program.alloc_register();
     let rowid_reg = program.alloc_register();
 
-    // === Execute anchor query directly ===
-    // For simple anchors without FROM clause (like SELECT 1), evaluate expressions directly
-    let anchor = &recursive_cte.anchor;
+    // === Execute anchor query using the pre-planned anchor_plan ===
+    // The anchor_plan was prepared during query planning and contains all necessary
+    // table references, conditions, and result columns already bound.
+    if let Some(mut anchor_plan) = recursive_cte.anchor_plan {
+        use super::plan::QueryDestination;
 
-    // Extract columns from anchor (must be OneSelect::Select variant)
-    let anchor_columns = match anchor {
-        turso_parser::ast::OneSelect::Select { columns, .. } => columns,
-        turso_parser::ast::OneSelect::Values(_) => {
-            return Err(crate::LimboError::ParseError(
-                "Recursive CTE anchor cannot be VALUES".into(),
-            ));
-        }
-    };
+        // Create a custom destination that inserts into both output AND working tables
+        // For now, we'll use a CoroutineYield-style approach where we emit the anchor
+        // and manually insert each result row into both tables
 
-    // Emit anchor row values
-    for (i, result_col) in anchor_columns.iter().enumerate() {
-        match result_col {
-            ResultColumn::Expr(expr, _alias) => {
-                // Emit bytecode to evaluate this expression into row_reg_start + i
-                translate_expr(
-                    program,
-                    None, // No table references for simple anchor
-                    expr.as_ref(),
-                    row_reg_start + i,
-                    &t_ctx.resolver,
-                )?;
-            }
-            ResultColumn::Star | ResultColumn::TableStar(_) => {
-                // Star shouldn't appear in a simple anchor
-                return Err(crate::LimboError::ParseError(
-                    "Recursive CTE anchor cannot use *".into(),
-                ));
-            }
+        // Set up the anchor to yield rows via coroutine
+        let yield_reg = program.alloc_register();
+        let coroutine_start = program.allocate_label();
+        let coroutine_end = program.allocate_label();
+        let insert_loop_start = program.allocate_label();
+
+        anchor_plan.query_destination = QueryDestination::CoroutineYield {
+            yield_reg,
+            coroutine_implementation_start: coroutine_start,
+        };
+
+        // Initialize the coroutine - jump over the coroutine body to the insertion loop
+        program.emit_insn(Insn::InitCoroutine {
+            yield_reg,
+            jump_on_definition: insert_loop_start,
+            start_offset: coroutine_start,
+        });
+
+        // Emit the coroutine body (the anchor query)
+        program.preassign_label_to_next_insn(coroutine_start);
+
+        // Create a new TranslateCtx for the anchor query
+        let mut anchor_ctx = super::emitter::TranslateCtx::new(
+            program,
+            t_ctx.resolver.schema,
+            t_ctx.resolver.symbol_table,
+            anchor_plan.table_references.joined_tables().len(),
+        );
+
+        let anchor_result_reg = super::emitter::emit_query(program, &mut anchor_plan, &mut anchor_ctx)?;
+
+        program.emit_insn(Insn::EndCoroutine { yield_reg });
+
+        // Insertion loop - call the coroutine and insert each row
+        program.preassign_label_to_next_insn(insert_loop_start);
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: coroutine_end,
+        });
+
+        // Copy result columns to our row registers
+        for i in 0..num_columns {
+            program.emit_insn(Insn::Copy {
+                src_reg: anchor_result_reg + i,
+                dst_reg: row_reg_start + i,
+                extra_amount: 0,
+            });
         }
+
+        // Make record and insert into output
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: row_reg_start,
+            count: num_columns,
+            dest_reg: record_reg,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::NewRowid {
+            cursor: output_cursor_id,
+            rowid_reg,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: output_cursor_id,
+            key_reg: rowid_reg,
+            record_reg,
+            flag: crate::vdbe::insn::InsertFlags::new(),
+            table_name: "cte_output".to_string(),
+        });
+
+        // Also insert into working table
+        program.emit_insn(Insn::NewRowid {
+            cursor: working_cursor_id,
+            rowid_reg,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: working_cursor_id,
+            key_reg: rowid_reg,
+            record_reg,
+            flag: crate::vdbe::insn::InsertFlags::new(),
+            table_name: "cte_working".to_string(),
+        });
+
+        // Go back to get the next anchor row
+        program.emit_insn(Insn::Goto {
+            target_pc: insert_loop_start,
+        });
+
+        program.preassign_label_to_next_insn(coroutine_end);
+    } else {
+        // Fallback for simple anchors without FROM clause (shouldn't happen with proper planning)
+        return Err(crate::LimboError::ParseError(
+            "Recursive CTE anchor_plan is missing".into(),
+        ));
     }
 
-    // Make record and insert into output
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: row_reg_start,
-        count: num_columns,
-        dest_reg: record_reg,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::NewRowid {
-        cursor: output_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: output_cursor_id,
-        key_reg: rowid_reg,
-        record_reg,
-        flag: crate::vdbe::insn::InsertFlags::new(),
-        table_name: "cte_output".to_string(),
-    });
-
-    // Also insert into working table
-    program.emit_insn(Insn::NewRowid {
-        cursor: working_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: working_cursor_id,
-        key_reg: rowid_reg,
-        record_reg,
-        flag: crate::vdbe::insn::InsertFlags::new(),
-        table_name: "cte_working".to_string(),
-    });
-
-    // === Extract and bind recursive member expressions ===
-    let (recursive_columns, recursive_where) = match &recursive_cte.recursive_member {
-        turso_parser::ast::OneSelect::Select { columns, where_clause, .. } => {
-            (columns.clone(), where_clause.clone())
+    // === Extract and process recursive member ===
+    let (recursive_columns, recursive_where, recursive_from) = match &recursive_cte.recursive_member {
+        turso_parser::ast::OneSelect::Select { columns, where_clause, from, .. } => {
+            (columns.clone(), where_clause.clone(), from.clone())
         }
         turso_parser::ast::OneSelect::Values(_) => {
             return Err(crate::LimboError::ParseError(
@@ -914,13 +1058,139 @@ pub fn emit_recursive_cte(
         }
     };
 
-    // Bind CTE column references in recursive member expressions
+    // Parse the FROM clause to find tables other than the CTE
+    // These tables need to be opened and joined with the CTE
+    let mut other_tables: Vec<(String, Arc<crate::schema::BTreeTable>, CursorID, ast::TableInternalId)> = Vec::new();
+
+    if let Some(ref from_clause) = recursive_from {
+        // Helper function to extract table name from SelectTable
+        fn get_table_name(select_table: &turso_parser::ast::SelectTable) -> Option<String> {
+            match select_table {
+                turso_parser::ast::SelectTable::Table(qualified_name, _, _) => {
+                    Some(crate::util::normalize_ident(qualified_name.name.as_str()))
+                }
+                _ => None,
+            }
+        }
+
+        // Process the main table in FROM clause
+        if let Some(table_name) = get_table_name(&from_clause.select) {
+            if !table_name.eq_ignore_ascii_case(&recursive_cte.name) {
+                // This is a real table, not the CTE - look it up in schema
+                match t_ctx.resolver.schema.get_table(&table_name) {
+                    Some(table) => {
+                        if let crate::schema::Table::BTree(btree_table) = table.as_ref() {
+                            let table_internal_id = program.table_reference_counter.next();
+                            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone()));
+                            other_tables.push((table_name.clone(), btree_table.clone(), cursor_id, table_internal_id));
+                        } else {
+                            return Err(crate::LimboError::ParseError(
+                                format!("Table '{}' in recursive member must be a regular table", table_name),
+                            ));
+                        }
+                    }
+                    None => {
+                        return Err(crate::LimboError::ParseError(
+                            format!("no such table: {}", table_name),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Process joined tables
+        for join in &from_clause.joins {
+            if let Some(table_name) = get_table_name(&join.table) {
+                if !table_name.eq_ignore_ascii_case(&recursive_cte.name) {
+                    // This is a real table, not the CTE
+                    match t_ctx.resolver.schema.get_table(&table_name) {
+                        Some(table) => {
+                            if let crate::schema::Table::BTree(btree_table) = table.as_ref() {
+                                let table_internal_id = program.table_reference_counter.next();
+                                let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone()));
+                                other_tables.push((table_name.clone(), btree_table.clone(), cursor_id, table_internal_id));
+                            } else {
+                                return Err(crate::LimboError::ParseError(
+                                    format!("Table '{}' in recursive member must be a regular table", table_name),
+                                ));
+                            }
+                        }
+                        None => {
+                            return Err(crate::LimboError::ParseError(
+                                format!("no such table: {}", table_name),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Currently, we only support one external table in the recursive member
+        if other_tables.len() > 1 {
+            return Err(crate::LimboError::ParseError(
+                "Recursive CTEs with multiple external tables are not yet supported".into(),
+            ));
+        }
+    }
+
+    // Build TableReferences for the recursive member
+    // Include both the CTE (represented by working table) and any other tables
+    let mut joined_tables_for_recursive = Vec::new();
+
+    // Add the CTE as a "table" - its columns come from the working cursor
+    let cte_table_for_refs = crate::schema::Table::RecursiveCte(RecursiveCte {
+        name: recursive_cte.name.clone(),
+        columns: recursive_cte.columns.clone(),
+        anchor: recursive_cte.anchor.clone(),
+        recursive_member: recursive_cte.recursive_member.clone(),
+        anchor_plan: None, // Not needed for table references
+    });
+    joined_tables_for_recursive.push(JoinedTable {
+        op: Operation::default_scan_for(&cte_table_for_refs),
+        table: cte_table_for_refs,
+        identifier: recursive_cte.name.clone(),
+        internal_id,
+        join_info: None,
+        col_used_mask: ColumnUsedMask::default(),
+        column_use_counts: Vec::new(),
+        expression_index_usages: Vec::new(),
+        database_id: 0,
+    });
+
+    // Add other tables
+    for (table_name, btree_table, cursor_id, table_internal_id) in &other_tables {
+        let table = crate::schema::Table::BTree(btree_table.clone());
+        joined_tables_for_recursive.push(JoinedTable {
+            op: Operation::default_scan_for(&table),
+            table,
+            identifier: table_name.clone(),
+            internal_id: *table_internal_id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+        });
+    }
+
+    let mut table_refs_for_recursive = TableReferences::new(joined_tables_for_recursive, vec![]);
+
+    // Build a mapping of table names to their info for expression binding
+    let mut table_name_to_info: Vec<(&str, ast::TableInternalId, &crate::schema::BTreeTable)> = Vec::new();
+    for (table_name, btree_table, _, table_internal_id) in &other_tables {
+        table_name_to_info.push((table_name.as_str(), *table_internal_id, btree_table.as_ref()));
+    }
+
+    // Bind and rewrite expressions using the table references
     let mut bound_recursive_exprs: Vec<ast::Expr> = Vec::new();
     for result_col in &recursive_columns {
         match result_col {
             ResultColumn::Expr(expr, _) => {
                 let mut bound_expr = expr.as_ref().clone();
+                // First bind CTE column references
                 bind_cte_columns_in_expr(&mut bound_expr, &recursive_cte.name, &column_names, internal_id);
+                // Then bind other table column references
+                bind_table_columns_in_expr(&mut bound_expr, &table_name_to_info);
                 bound_recursive_exprs.push(bound_expr);
             }
             ResultColumn::Star | ResultColumn::TableStar(_) => {
@@ -932,11 +1202,23 @@ pub fn emit_recursive_cte(
     }
 
     // Bind WHERE clause if present
-    let bound_where = recursive_where.map(|w| {
+    let bound_where = if let Some(w) = recursive_where {
         let mut bound = w.as_ref().clone();
         bind_cte_columns_in_expr(&mut bound, &recursive_cte.name, &column_names, internal_id);
-        bound
-    });
+        bind_table_columns_in_expr(&mut bound, &table_name_to_info);
+        Some(bound)
+    } else {
+        None
+    };
+
+    // === Open cursors for other tables ===
+    for (_table_name, btree_table, cursor_id, _) in &other_tables {
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: *cursor_id,
+            root_page: btree_table.root_page,
+            db: 0,
+        });
+    }
 
     // === Recursive loop ===
     let recursive_loop_start = program.allocate_label();
@@ -981,11 +1263,11 @@ pub fn emit_recursive_cte(
         cursor_id: temp_cursor_id,
     });
 
-    // Inner loop: iterate over working table, evaluate recursive member
-    let inner_loop_start = program.allocate_label();
-    let inner_loop_next = program.allocate_label();
+    // Inner loop over working table (CTE rows)
+    let cte_loop_start = program.allocate_label();
+    let cte_loop_next = program.allocate_label();
 
-    program.preassign_label_to_next_insn(inner_loop_start);
+    program.preassign_label_to_next_insn(cte_loop_start);
 
     // Read columns from working table into registers
     for i in 0..num_columns {
@@ -1013,28 +1295,84 @@ pub fn emit_recursive_cte(
         local_resolver.expr_to_reg_cache.push((Cow::Owned(col_expr), row_reg_start + i));
     }
 
-    // Apply WHERE clause if present - skip to next row if condition fails
+    // Allocate registers for other table columns
+    let mut table_column_regs: Vec<(ast::TableInternalId, usize)> = Vec::new();
+    for (_table_name, btree_table, _, table_internal_id) in &other_tables {
+        let num_cols = btree_table.columns.len();
+        let col_start_reg = program.alloc_registers(num_cols);
+        table_column_regs.push((*table_internal_id, col_start_reg));
+
+        // Add cache entries for each column of this table
+        for (i, col) in btree_table.columns.iter().enumerate() {
+            let col_expr = ast::Expr::Column {
+                database: None,
+                table: *table_internal_id,
+                column: i,
+                is_rowid_alias: col.is_rowid_alias(),
+            };
+            local_resolver.expr_to_reg_cache.push((Cow::Owned(col_expr), col_start_reg + i));
+        }
+    }
+
+    // The innermost loop label (used for WHERE clause skip and Next)
+    let innermost_loop_next;
+
+    // If there are other tables, emit nested loops over them
+    // For now, support one other table (the common case)
+    let other_table_loop_info: Option<(CursorID, BranchOffset, BranchOffset, usize)>;
+
+    if let Some((_, btree_table, cursor_id, _)) = other_tables.first() {
+        let other_loop_start = program.allocate_label();
+        let other_loop_next = program.allocate_label();
+
+        // Rewind the other table
+        program.emit_insn(Insn::Rewind {
+            cursor_id: *cursor_id,
+            pc_if_empty: cte_loop_next,
+        });
+
+        program.preassign_label_to_next_insn(other_loop_start);
+
+        // Read columns from the other table
+        if let Some((_, col_start_reg)) = table_column_regs.first() {
+            for (i, col) in btree_table.columns.iter().enumerate() {
+                if col.is_rowid_alias() {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: *cursor_id,
+                        dest: col_start_reg + i,
+                    });
+                } else {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: *cursor_id,
+                        column: i,
+                        dest: col_start_reg + i,
+                        default: None,
+                    });
+                }
+            }
+        }
+
+        other_table_loop_info = Some((*cursor_id, other_loop_start, other_loop_next, btree_table.columns.len()));
+        innermost_loop_next = other_loop_next;
+    } else {
+        other_table_loop_info = None;
+        innermost_loop_next = cte_loop_next;
+    }
+
+    // Apply WHERE clause if present - skip to innermost next if condition fails
     if let Some(ref where_expr) = bound_where {
-        // Create an empty TableReferences for translate_condition_expr
-        let empty_table_refs = TableReferences::new(vec![], vec![]);
-        // When jump_if_condition_is_true is false:
-        // - Use the opposite operator (e.g., x<5 becomes x>=5)
-        // - Jump to jump_target_when_false when the opposite is true (i.e., when original condition is false)
-        // - Fall through when the original condition is true
-        // This means: if x>=5, skip to next row; if x<5, continue to evaluate expressions
         translate_condition_expr(
             program,
-            &empty_table_refs,
+            &table_refs_for_recursive,
             where_expr,
             ConditionMetadata {
                 jump_if_condition_is_true: false,
-                jump_target_when_true: inner_loop_next, // Not used when jump_if_condition_is_true is false
-                jump_target_when_false: inner_loop_next, // Jump here when condition is FALSE
-                jump_target_when_null: inner_loop_next, // Treat NULL as false
+                jump_target_when_true: innermost_loop_next,
+                jump_target_when_false: innermost_loop_next,
+                jump_target_when_null: innermost_loop_next,
             },
             &local_resolver,
         )?;
-        // Fall through here when condition is true - continue to evaluate expressions
     }
 
     // Evaluate recursive member expressions into result registers
@@ -1069,10 +1407,21 @@ pub fn emit_recursive_cte(
         table_name: "cte_temp".to_string(),
     });
 
-    program.preassign_label_to_next_insn(inner_loop_next);
+    // Close nested loops (inner to outer)
+    // First close the other table loop if it exists
+    if let Some((other_cursor_id, other_loop_start, other_loop_next, _)) = other_table_loop_info {
+        program.preassign_label_to_next_insn(other_loop_next);
+        program.emit_insn(Insn::Next {
+            cursor_id: other_cursor_id,
+            pc_if_next: other_loop_start,
+        });
+    }
+
+    // Then close the CTE working table loop
+    program.preassign_label_to_next_insn(cte_loop_next);
     program.emit_insn(Insn::Next {
         cursor_id: working_cursor_id,
-        pc_if_next: inner_loop_start,
+        pc_if_next: cte_loop_start,
     });
 
     // Check if temp is empty

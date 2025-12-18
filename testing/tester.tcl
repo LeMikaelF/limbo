@@ -46,6 +46,11 @@ proc evaluate_sql {sqlite_exec db_name sql} {
 
     set command [list $sqlite_exec $db_name]
     set output [exec echo $statements | {*}$command]
+    # Strip debug header line if present (e.g., "############ io: Syscall")
+    if {[string match "########*" $output]} {
+        set lines [split $output "\n"]
+        set output [join [lrange $lines 1 end] "\n"]
+    }
     return $output
 }
 
