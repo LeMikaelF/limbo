@@ -37,7 +37,10 @@ public final class TursoConnection {
 
   private static TursoDB open(String url, String filePath, Properties properties)
       throws SQLException {
-    return TursoDBFactory.open(url, filePath, properties);
+    if (filePath.isEmpty()) {
+      throw new IllegalArgumentException("filePath should not be empty");
+    }
+    return TursoDB.create(url, filePath);
   }
 
   public void checkOpen() throws SQLException {
