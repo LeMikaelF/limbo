@@ -585,6 +585,93 @@ fn parse_table(
     crate::bail_parse_error!("no such table: {}", normalized_qualified_name);
 }
 
+/// Parse a LATERAL subquery in the FROM clause.
+/// LATERAL allows the subquery to reference columns from preceding tables
+/// in the same FROM clause, not just from outer queries.
+#[allow(clippy::too_many_arguments)]
+fn parse_lateral_from_clause_table(
+    table: ast::SelectTable,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    ctes: &[JoinedTable],
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    match table {
+        ast::SelectTable::Select(subselect, maybe_alias) => {
+            // For LATERAL, build outer_query_refs from:
+            // 1. Existing outer_query_refs (from enclosing queries)
+            // 2. CTEs
+            // 3. ALL PRECEDING joined_tables (this is the key for LATERAL!)
+            let outer_query_refs_for_subquery = table_references
+                .outer_query_refs()
+                .iter()
+                .cloned()
+                .chain(
+                    ctes.iter()
+                        .cloned()
+                        .map(|t: JoinedTable| OuterQueryReference {
+                            identifier: t.identifier,
+                            internal_id: t.internal_id,
+                            table: t.table,
+                            col_used_mask: ColumnUsedMask::default(),
+                        }),
+                )
+                .chain(
+                    // Include ALL preceding joined tables for LATERAL
+                    table_references
+                        .joined_tables()
+                        .iter()
+                        .cloned()
+                        .map(|t: JoinedTable| OuterQueryReference {
+                            identifier: t.identifier,
+                            internal_id: t.internal_id,
+                            table: t.table,
+                            col_used_mask: ColumnUsedMask::default(),
+                        }),
+                )
+                .collect::<Vec<_>>();
+
+            let Plan::Select(subplan) = prepare_select_plan(
+                subselect,
+                resolver,
+                program,
+                &outer_query_refs_for_subquery,
+                QueryDestination::placeholder_for_subquery(),
+                connection,
+            )?
+            else {
+                crate::bail_parse_error!(
+                    "Only non-compound SELECT queries are currently supported in LATERAL subqueries"
+                );
+            };
+
+            let cur_table_index = table_references.joined_tables().len();
+            let identifier = maybe_alias
+                .map(|a| match a {
+                    ast::As::As(id) => id,
+                    ast::As::Elided(id) => id,
+                })
+                .map(|id| normalize_ident(id.as_str()))
+                .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
+
+            table_references.add_joined_table(JoinedTable::new_subquery(
+                identifier,
+                subplan,
+                None,
+                program.table_reference_counter.next(),
+            )?);
+            Ok(())
+        }
+        ast::SelectTable::Table(..) | ast::SelectTable::TableCall(..) => {
+            crate::bail_parse_error!("LATERAL can only be used with subqueries, not tables");
+        }
+        _ => {
+            crate::bail_parse_error!("LATERAL can only be used with subqueries");
+        }
+    }
+}
+
 fn transform_args_into_where_terms(
     args: &[Box<Expr>],
     internal_id: TableInternalId,
@@ -1050,15 +1137,33 @@ fn parse_join(
         constraint,
     } = join;
 
-    parse_from_clause_table(
-        table.as_ref().clone(),
-        resolver,
-        program,
-        table_references,
-        vtab_predicates,
-        ctes,
-        connection,
-    )?;
+    // Check if this is a LATERAL join
+    let is_lateral = matches!(
+        &join_operator,
+        ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::LATERAL)
+    );
+
+    if is_lateral {
+        // LATERAL join: pass preceding tables as outer_query_refs
+        parse_lateral_from_clause_table(
+            table.as_ref().clone(),
+            resolver,
+            program,
+            table_references,
+            ctes,
+            connection,
+        )?;
+    } else {
+        parse_from_clause_table(
+            table.as_ref().clone(),
+            resolver,
+            program,
+            table_references,
+            vtab_predicates,
+            ctes,
+            connection,
+        )?;
+    }
 
     let (outer, natural) = match join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
@@ -1067,6 +1172,12 @@ fn parse_join(
             }
             if join_type.contains(JoinType::CROSS) {
                 crate::bail_parse_error!("CROSS JOIN is not supported");
+            }
+            // LATERAL LEFT/RIGHT/OUTER is not supported (validation in parser, but double-check)
+            if join_type.contains(JoinType::LATERAL)
+                && join_type.intersects(JoinType::LEFT | JoinType::RIGHT | JoinType::OUTER)
+            {
+                crate::bail_parse_error!("LATERAL LEFT/RIGHT/OUTER JOIN is not supported");
             }
             let is_outer = join_type.contains(JoinType::OUTER);
             let is_natural = join_type.contains(JoinType::NATURAL);

@@ -103,6 +103,7 @@ fn join_type_from_bytes(s: &[u8]) -> Result<JoinType> {
         b"FULL" => Ok(JoinType::LEFT | JoinType::RIGHT | JoinType::OUTER),
         b"INNER" => Ok(JoinType::INNER),
         b"LEFT" => Ok(JoinType::LEFT | JoinType::OUTER),
+        b"LATERAL" => Ok(JoinType::LATERAL),
         b"NATURAL" => Ok(JoinType::NATURAL),
         b"RIGHT" => Ok(JoinType::RIGHT | JoinType::OUTER),
         b"OUTER" => Ok(JoinType::OUTER),
@@ -134,6 +135,15 @@ fn new_join_type(n0: &[u8], n1: Option<&[u8]>, n2: Option<&[u8]>) -> Result<Join
             from_bytes_as_str(n1.unwrap_or(&[])),
             from_bytes_as_str(n2.unwrap_or(&[])),
         )));
+    }
+
+    // LATERAL cannot be combined with LEFT, RIGHT, or OUTER
+    if jt.contains(JoinType::LATERAL)
+        && jt.intersects(JoinType::LEFT | JoinType::RIGHT | JoinType::OUTER)
+    {
+        return Err(Error::Custom(
+            "LATERAL cannot be combined with LEFT, RIGHT, or OUTER".to_string(),
+        ));
     }
 
     Ok(jt)
@@ -11724,5 +11734,63 @@ mod tests {
                 assert_eq!(result, expected.clone(), "Input: {rstring:?}");
             }
         }
+    }
+
+    #[test]
+    fn test_lateral_join_parses() {
+        // Basic LATERAL JOIN should parse
+        let sql = b"SELECT * FROM t1 LATERAL JOIN (SELECT * FROM t2) AS sub";
+        let mut parser = Parser::new(sql);
+        let result = parser.next_cmd();
+        assert!(result.is_ok(), "LATERAL JOIN should parse: {:?}", result);
+    }
+
+    #[test]
+    fn test_lateral_inner_join_parses() {
+        // LATERAL INNER JOIN should parse
+        let sql = b"SELECT * FROM t1 LATERAL INNER JOIN (SELECT * FROM t2) AS sub";
+        let mut parser = Parser::new(sql);
+        let result = parser.next_cmd();
+        assert!(
+            result.is_ok(),
+            "LATERAL INNER JOIN should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lateral_left_join_rejected() {
+        // LATERAL LEFT JOIN should be rejected by the parser
+        let sql = b"SELECT * FROM t1 LATERAL LEFT JOIN (SELECT 1) AS sub";
+        let mut parser = Parser::new(sql);
+        let result = parser.next_cmd();
+        assert!(
+            result.is_err(),
+            "LATERAL LEFT JOIN should be rejected by parser"
+        );
+    }
+
+    #[test]
+    fn test_lateral_right_join_rejected() {
+        // LATERAL RIGHT JOIN should be rejected by the parser
+        let sql = b"SELECT * FROM t1 LATERAL RIGHT JOIN (SELECT 1) AS sub";
+        let mut parser = Parser::new(sql);
+        let result = parser.next_cmd();
+        assert!(
+            result.is_err(),
+            "LATERAL RIGHT JOIN should be rejected by parser"
+        );
+    }
+
+    #[test]
+    fn test_lateral_outer_join_rejected() {
+        // LATERAL OUTER JOIN should be rejected by the parser
+        let sql = b"SELECT * FROM t1 LATERAL OUTER JOIN (SELECT 1) AS sub";
+        let mut parser = Parser::new(sql);
+        let result = parser.next_cmd();
+        assert!(
+            result.is_err(),
+            "LATERAL OUTER JOIN should be rejected by parser"
+        );
     }
 }

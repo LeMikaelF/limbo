@@ -1,0 +1,118 @@
+d#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Basic lateral join - subquery can reference preceding table
+do_execsql_test lateral-basic {
+    SELECT u.id, sub.cnt
+    FROM users u
+    LATERAL JOIN (SELECT count(*) as cnt FROM products WHERE products.id <= u.id) AS sub
+    LIMIT 3;
+} {1|1
+2|2
+3|3}
+
+# Lateral with simple column reference
+do_execsql_test lateral-column-ref {
+    SELECT res FROM (SELECT 42 AS x) AS q1
+    LATERAL JOIN (SELECT x + 1 AS res) AS result;
+} {43}
+
+# Chained lateral joins - each can reference all preceding tables
+do_execsql_test lateral-chained {
+    SELECT y3
+    FROM (SELECT 10 AS x) AS t1
+    LATERAL JOIN (SELECT x * 2 AS y1) AS t2
+    LATERAL JOIN (SELECT y1 + 1 AS y2) AS t3
+    LATERAL JOIN (SELECT y2 * 2 AS y3) AS t4;
+} {42}
+
+# Lateral with WHERE clause
+do_execsql_test lateral-where {
+    SELECT u.first_name, p.name
+    FROM users u
+    LATERAL JOIN (SELECT name FROM products WHERE products.id = u.id) AS p
+    WHERE u.id <= 3;
+} {Jamie|hat
+Cindy|cap
+Tommy|shirt}
+
+# Lateral without FROM in subquery
+do_execsql_test lateral-no-from {
+    SELECT x, y
+    FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) AS nums
+    LATERAL JOIN (SELECT x * 10 AS y) AS mult;
+} {1|10
+2|20
+3|30}
+
+# Lateral join with correlated subquery using table.column reference
+do_execsql_test lateral-table-qualified-ref {
+    SELECT t1.a, t2.b FROM
+        (SELECT 5 AS a) AS t1
+        LATERAL JOIN (SELECT t1.a + 100 AS b) AS t2;
+} {5|105}
+
+# LATERAL INNER JOIN (explicit INNER keyword)
+do_execsql_test lateral-inner-join {
+    SELECT x, doubled
+    FROM (SELECT 7 AS x) AS t1
+    LATERAL INNER JOIN (SELECT x * 2 AS doubled) AS t2;
+} {7|14}
+
+# Multiple columns from lateral subquery
+do_execsql_test lateral-multi-columns {
+    SELECT a, b, c
+    FROM (SELECT 1 AS val) AS src
+    LATERAL JOIN (SELECT val AS a, val + 1 AS b, val + 2 AS c) AS derived;
+} {1|2|3}
+
+# Lateral with aggregate in subquery
+do_execsql_test lateral-aggregate {
+    SELECT u.id, u.first_name, sub.product_count
+    FROM users u
+    LATERAL JOIN (
+        SELECT count(*) as product_count
+        FROM products
+        WHERE products.id <= u.id
+    ) AS sub
+    WHERE u.id <= 5;
+} {1|Jamie|1
+2|Cindy|2
+3|Tommy|3
+4|Jennifer|4
+5|Edward|5}
+
+# Lateral with ORDER BY and LIMIT in subquery
+do_execsql_test lateral-order-limit {
+    SELECT u.id, p.name
+    FROM (SELECT 1 as id UNION ALL SELECT 2 UNION ALL SELECT 3) AS u
+    LATERAL JOIN (
+        SELECT name FROM products WHERE products.id <= u.id ORDER BY name LIMIT 1
+    ) AS p;
+} {1|hat
+2|cap
+3|cap}
+
+# Error case: LATERAL with table (not subquery)
+do_test lateral-table-error {
+    catchsql {SELECT * FROM users LATERAL JOIN products}
+} {1 {Parse error: LATERAL can only be used with subqueries, not tables}}
+
+# Error case: LATERAL LEFT JOIN not supported
+do_test lateral-left-error {
+    catchsql {SELECT * FROM users LATERAL LEFT JOIN (SELECT 1) AS sub}
+} {1 {Parse error: LATERAL cannot be combined with LEFT, RIGHT, or OUTER}}
+
+# Error case: LATERAL RIGHT JOIN not supported
+do_test lateral-right-error {
+    catchsql {SELECT * FROM users LATERAL RIGHT JOIN (SELECT 1) AS sub}
+} {1 {Parse error: LATERAL cannot be combined with LEFT, RIGHT, or OUTER}}
+
+# Error case: LATERAL OUTER JOIN not supported
+do_test lateral-outer-error {
+    catchsql {SELECT * FROM users LATERAL OUTER JOIN (SELECT 1) AS sub}
+} {1 {Parse error: LATERAL cannot be combined with LEFT, RIGHT, or OUTER}}
+
+finish_test
