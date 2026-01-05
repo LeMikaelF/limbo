@@ -439,7 +439,7 @@ pub fn emit_query<'a>(
     open_loop(
         program,
         t_ctx,
-        &plan.table_references,
+        &mut plan.table_references,
         &plan.join_order,
         &plan.where_clause,
         None,
@@ -528,6 +528,7 @@ fn emit_program_for_delete(
             table_id: t.internal_id,
             original_idx: i,
             is_outer: false,
+            is_lateral: false,
         })
         .collect::<Vec<_>>();
 
@@ -641,7 +642,7 @@ fn emit_program_for_delete(
         open_loop(
             program,
             &mut t_ctx,
-            &plan.table_references,
+            &mut plan.table_references,
             &join_order,
             &plan.where_clause,
             None,
@@ -1343,6 +1344,7 @@ fn emit_program_for_update(
             table_id: t.internal_id,
             original_idx: i,
             is_outer: false,
+            is_lateral: false,
         })
         .collect::<Vec<_>>();
 
@@ -1388,7 +1390,7 @@ fn emit_program_for_update(
     open_loop(
         program,
         &mut t_ctx,
-        &plan.table_references,
+        &mut plan.table_references,
         &join_order,
         &plan.where_clause,
         temp_cursor_id,

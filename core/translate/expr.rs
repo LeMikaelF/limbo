@@ -2347,11 +2347,30 @@ pub fn translate_expr(
                 Table::FromClauseSubquery(from_clause_subquery) => {
                     // If we are reading a column from a subquery, we instead copy the column from the
                     // subquery's result registers.
-                    program.emit_insn(Insn::Copy {
-                        src_reg: from_clause_subquery
+                    // For outer query references (e.g., LATERAL subqueries referencing other subqueries),
+                    // the result_columns_start_reg might be stored in ProgramBuilder (set when LATERAL
+                    // subqueries are emitted), in OuterQueryReference, or in the cloned Table.
+                    let result_start_reg = if is_from_outer_query_scope {
+                        // First try ProgramBuilder (set when LATERAL subqueries are emitted)
+                        program
+                            .get_subquery_result_reg(*table_ref_id)
+                            // Then try OuterQueryReference
+                            .or_else(|| {
+                                referenced_tables
+                                    .unwrap()
+                                    .find_outer_query_ref_by_internal_id(*table_ref_id)
+                                    .and_then(|outer_ref| outer_ref.result_columns_start_reg)
+                            })
+                            // Finally try the cloned table
+                            .or(from_clause_subquery.result_columns_start_reg)
+                            .expect("Subquery result_columns_start_reg must be set for outer query reference")
+                    } else {
+                        from_clause_subquery
                             .result_columns_start_reg
                             .expect("Subquery result_columns_start_reg must be set")
-                            + *column,
+                    };
+                    program.emit_insn(Insn::Copy {
+                        src_reg: result_start_reg + *column,
                         dst_reg: target_register,
                         extra_amount: 0,
                     });

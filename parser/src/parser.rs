@@ -2260,7 +2260,7 @@ impl<'a> Parser<'a> {
     fn parse_joined_tables(&mut self) -> Result<Vec<JoinedSelectTable>> {
         let mut result = vec![];
         while let Some(tok) = self.peek()? {
-            let op = match tok.token_type {
+            let mut op = match tok.token_type {
                 TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
                     JoinOperator::Comma
@@ -2307,10 +2307,39 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
 
-            let tok = peek_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW, TK_LP);
+            // Check for LATERAL keyword after join operator
+            let is_lateral = match self.peek()? {
+                Some(tok) if tok.token_type == TK_LATERAL => {
+                    eat_assert!(self, TK_LATERAL);
+                    true
+                }
+                _ => false,
+            };
+
+            // If LATERAL is specified, add LATERAL flag to join type
+            if is_lateral {
+                op = match op {
+                    JoinOperator::Comma => JoinOperator::TypedJoin(Some(JoinType::LATERAL)),
+                    JoinOperator::TypedJoin(None) => {
+                        JoinOperator::TypedJoin(Some(JoinType::LATERAL))
+                    }
+                    JoinOperator::TypedJoin(Some(jt)) => {
+                        JoinOperator::TypedJoin(Some(jt | JoinType::LATERAL))
+                    }
+                };
+            }
+
+            let tok = peek_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW, TK_LP, TK_LATERAL);
 
             match tok.token_type.fallback_id_if_ok() {
-                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW => {
+                TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LATERAL => {
+                    // LATERAL is only valid before subqueries, not table names
+                    if is_lateral {
+                        return Err(Error::Custom(
+                            "LATERAL can only be used with subqueries, not table references"
+                                .to_string(),
+                        ));
+                    }
                     let name = self.parse_fullname(false)?;
                     match self.peek()? {
                         None => {

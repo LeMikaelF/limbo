@@ -192,6 +192,7 @@ fn prepare_window_subquery(
         table_id: subquery_id,
         original_idx: 0,
         is_outer: false,
+        is_lateral: false,
     }];
     let new_table_references = TableReferences::new(vec![], vec![]);
 
@@ -226,6 +227,7 @@ fn prepare_window_subquery(
         inner_plan,
         None,
         subquery_id,
+        false, // Window subqueries are not lateral
     )?;
 
     // Verify that the subquery has the expected database ID.

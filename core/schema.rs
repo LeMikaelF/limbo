@@ -1718,6 +1718,8 @@ pub struct FromClauseSubquery {
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
+    /// Whether this is a LATERAL subquery that can reference columns from preceding tables.
+    pub lateral: bool,
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {

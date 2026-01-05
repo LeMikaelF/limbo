@@ -179,6 +179,7 @@ pub enum TokenType {
     TK_FILTER = 167,
     TK_ILLEGAL = 185,
     TK_CONCURRENT = 186,
+    TK_LATERAL = 187,
     // None token
     TK_NONE = 255,
 }
@@ -233,6 +234,7 @@ impl TokenType {
             TokenType::TK_EXCLUDE => Some("EXCLUDE"),
             TokenType::TK_EXCLUSIVE => Some("EXCLUSIVE"),
             TokenType::TK_CONCURRENT => Some("CONCURRENT"),
+            TokenType::TK_LATERAL => Some("LATERAL"),
             TokenType::TK_EXISTS => Some("EXISTS"),
             TokenType::TK_EXPLAIN => Some("EXPLAIN"),
             TokenType::TK_FAIL => Some("FAIL"),
@@ -379,6 +381,7 @@ impl Display for TokenType {
             TK_IMMEDIATE => "TK_IMMEDIATE",
             TK_EXCLUSIVE => "TK_EXCLUSIVE",
             TK_CONCURRENT => "TK_CONCURRENT",
+            TK_LATERAL => "TK_LATERAL",
             TK_COMMIT => "TK_COMMIT",
             TK_END => "TK_END",
             TK_ROLLBACK => "TK_ROLLBACK",
@@ -561,7 +564,7 @@ impl TokenType {
             | TK_TRIGGER | TK_VACUUM | TK_VIEW | TK_VIRTUAL | TK_WITH | TK_NULLS | TK_FIRST
             | TK_LAST | TK_CURRENT | TK_FOLLOWING | TK_PARTITION | TK_PRECEDING | TK_RANGE
             | TK_UNBOUNDED | TK_EXCLUDE | TK_GROUPS | TK_OTHERS | TK_TIES | TK_ALWAYS
-            | TK_MATERIALIZED | TK_REINDEX | TK_RENAME | TK_CTIME_KW | TK_IF => TK_ID,
+            | TK_MATERIALIZED | TK_REINDEX | TK_RENAME | TK_CTIME_KW | TK_IF | TK_LATERAL => TK_ID,
             // | TK_COLUMNKW | TK_UNION | TK_EXCEPT | TK_INTERSECT | TK_GENERATED | TK_WITHOUT
             // see comments in `next_token` of parser
             _ => self,

@@ -153,6 +153,10 @@ pub struct ProgramBuilder {
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
+    /// Mapping from table internal ID to result columns start register for FROM clause subqueries.
+    /// This is used by LATERAL subqueries that reference other subqueries - the result_columns_start_reg
+    /// is stored here when a subquery is emitted, and looked up when translating expressions.
+    subquery_result_regs: HashMap<usize, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +337,7 @@ impl ProgramBuilder {
             is_subprogram,
             resolve_type: ResolveType::Abort,
             cursor_overrides: HashMap::new(),
+            subquery_result_regs: HashMap::new(),
         }
     }
 
@@ -1020,6 +1025,22 @@ impl ProgramBuilder {
 
     pub fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
         self.collation = c
+    }
+
+    /// Register the result columns start register for a subquery.
+    /// This is used by LATERAL subqueries to share result register info across contexts.
+    pub fn register_subquery_result_reg(
+        &mut self,
+        table_ref_id: TableInternalId,
+        result_columns_start_reg: usize,
+    ) {
+        self.subquery_result_regs
+            .insert(table_ref_id.into(), result_columns_start_reg);
+    }
+
+    /// Look up the result columns start register for a subquery.
+    pub fn get_subquery_result_reg(&self, table_ref_id: TableInternalId) -> Option<usize> {
+        self.subquery_result_regs.get(&table_ref_id.into()).copied()
     }
 
     pub fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {

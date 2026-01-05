@@ -289,6 +289,11 @@ fn add_ephemeral_table_to_update_plan(
                 internal_id: table.internal_id,
                 table: table.table.clone(),
                 col_used_mask: table.col_used_mask.clone(),
+                result_columns_start_reg: if let Table::FromClauseSubquery(subq) = &table.table {
+                    subq.result_columns_start_reg
+                } else {
+                    None
+                },
             });
     }
 
@@ -303,6 +308,10 @@ fn add_ephemeral_table_to_update_plan(
                 .join_info
                 .as_ref()
                 .is_some_and(|join_info| join_info.outer),
+            is_lateral: t
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.lateral),
         })
         .collect();
     let rowid_internal_id = table_references_ephemeral_select
@@ -802,6 +811,10 @@ fn optimize_table_access(
                 .join_info
                 .as_ref()
                 .is_some_and(|join_info| join_info.outer),
+            is_lateral: table_references.joined_tables_mut()[table_number]
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.lateral),
         })
         .collect();
 

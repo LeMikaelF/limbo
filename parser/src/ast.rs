@@ -903,6 +903,8 @@ bitflags::bitflags! {
         const RIGHT   = 0x10;
         /// `OUTER`
         const OUTER   = 0x20;
+        /// `LATERAL` - allows right side to reference left side columns
+        const LATERAL = 0x40;
     }
 }
 

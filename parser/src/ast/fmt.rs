@@ -1344,6 +1344,10 @@ impl ToTokens for JoinType {
                 s.append(TK_JOIN_KW, Some("OUTER"))?;
             }
         }
+        // LATERAL is output after the join type keywords but before JOIN
+        if self.contains(Self::LATERAL) {
+            s.append(TK_LATERAL, None)?;
+        }
         Ok(())
     }
 }

@@ -196,6 +196,7 @@ pub fn prepare_delete_plan(
                     table_id: t.internal_id,
                     original_idx: i,
                     is_outer: false,
+                    is_lateral: false,
                 })
                 .collect(),
             offset: resolved_offset,

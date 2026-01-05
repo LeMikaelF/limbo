@@ -294,6 +294,9 @@ pub struct JoinOrderMember {
     pub original_idx: usize,
     /// Whether this member is the right side of an OUTER JOIN
     pub is_outer: bool,
+    /// Whether this is a LATERAL join.
+    /// LATERAL joins cannot be reordered.
+    pub is_lateral: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -566,6 +569,9 @@ pub struct JoinInfo {
     pub outer: bool,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
     pub using: Vec<ast::Name>,
+    /// Whether this is a LATERAL join.
+    /// A LATERAL join allows the right side to reference columns from the left side.
+    pub lateral: bool,
 }
 
 /// A joined table in the query plan.
@@ -625,6 +631,11 @@ pub struct OuterQueryReference {
     /// i.e., if the subquery depends on tables T and U,
     /// then both T and U need to be in scope for the subquery to be evaluated.
     pub col_used_mask: ColumnUsedMask,
+    /// For LATERAL subquery outer references that are themselves FromClauseSubqueries,
+    /// this stores the start register of their result columns. This is needed because
+    /// the cloned Table in outer_query_refs doesn't have this value set (it's set on
+    /// the original table in the parent query's joined_tables).
+    pub result_columns_start_reg: Option<usize>,
 }
 
 impl OuterQueryReference {
@@ -1163,6 +1174,7 @@ impl JoinedTable {
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
+        lateral: bool,
     ) -> Result<Self> {
         let mut columns = plan
             .result_columns
@@ -1192,6 +1204,7 @@ impl JoinedTable {
             plan: Box::new(plan),
             columns,
             result_columns_start_reg: None,
+            lateral,
         });
         Ok(Self {
             op: Operation::default_scan_for(&table),

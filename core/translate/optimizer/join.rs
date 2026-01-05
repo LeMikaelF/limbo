@@ -386,6 +386,33 @@ pub fn compute_best_join_order<'a>(
 
     let num_tables = joined_tables.len();
 
+    // LATERAL joins cannot be reordered because the right side can reference columns
+    // from all preceding tables. If there are any LATERAL joins, use the naive
+    // left-deep plan which preserves the original query order.
+    let has_lateral_join = joined_tables
+        .iter()
+        .any(|t| t.join_info.as_ref().is_some_and(|j| j.lateral));
+    if has_lateral_join {
+        let naive_plan = compute_naive_left_deep_plan(
+            joined_tables,
+            maybe_order_target,
+            base_table_rows,
+            access_methods_arena,
+            constraints,
+            where_clause,
+            subqueries,
+        )?;
+        return match naive_plan {
+            Some(plan) => Ok(Some(BestJoinOrderResult {
+                best_plan: plan,
+                best_ordered_plan: None,
+            })),
+            None => Err(LimboError::PlanningError(
+                "No valid query plan found for LATERAL join".to_string(),
+            )),
+        };
+    }
+
     // For large queries, use greedy join ordering instead of exhaustive DP.
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
@@ -444,6 +471,7 @@ pub fn compute_best_join_order<'a>(
         table_id: TableInternalId::default(),
         original_idx: 0,
         is_outer: false,
+        is_lateral: false,
     });
 
     // Keep track of the current best cost so we can short-circuit planning for subplans
@@ -468,6 +496,7 @@ pub fn compute_best_join_order<'a>(
             table_id: table_ref.internal_id,
             original_idx: i,
             is_outer: false,
+            is_lateral: false,
         };
         assert!(join_order.len() == 1);
         let rel = join_lhs_and_rhs(
@@ -577,6 +606,10 @@ pub fn compute_best_join_order<'a>(
                             .join_info
                             .as_ref()
                             .is_some_and(|j| j.outer),
+                        is_lateral: joined_tables[table_no]
+                            .join_info
+                            .as_ref()
+                            .is_some_and(|j| j.lateral),
                     });
                 }
                 join_order.push(JoinOrderMember {
@@ -586,6 +619,10 @@ pub fn compute_best_join_order<'a>(
                         .join_info
                         .as_ref()
                         .is_some_and(|j| j.outer),
+                    is_lateral: joined_tables[rhs_idx]
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|j| j.lateral),
                 });
                 assert!(join_order.len() == subset_size);
 
@@ -687,7 +724,7 @@ pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 /// 1. Starting with the table that has best hub score (enables most index lookups)
 /// 2. Greedily adding the remaining table with lowest marginal cost
 ///
-/// Respects outer join ordering constraints.
+/// Respects outer join and LATERAL join ordering constraints.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_greedy_join_order<'a>(
     joined_tables: &[JoinedTable],
@@ -728,6 +765,7 @@ pub fn compute_greedy_join_order<'a>(
         table_id: first_table.internal_id,
         original_idx: first_idx,
         is_outer: false, // First table cannot be outer join RHS
+        is_lateral: false, // First table cannot be lateral
     });
     remaining.retain(|&x| x != first_idx);
 
@@ -775,6 +813,7 @@ pub fn compute_greedy_join_order<'a>(
             last.table_id = table.internal_id;
             last.original_idx = idx;
             last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.outer);
+            last.is_lateral = table.join_info.as_ref().is_some_and(|ji| ji.lateral);
 
             if let Some(plan) = join_lhs_and_rhs(
                 current_plan.as_ref(),
@@ -807,6 +846,7 @@ pub fn compute_greedy_join_order<'a>(
             table_id: next_table.internal_id,
             original_idx: next_idx,
             is_outer: next_table.join_info.as_ref().is_some_and(|ji| ji.outer),
+            is_lateral: next_table.join_info.as_ref().is_some_and(|ji| ji.lateral),
         });
         remaining.retain(|&x| x != next_idx);
         current_plan = Some(next_plan);
@@ -893,6 +933,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             table_id: t.internal_id,
             original_idx: i,
             is_outer: t.join_info.as_ref().is_some_and(|j| j.outer),
+            is_lateral: t.join_info.as_ref().is_some_and(|j| j.lateral),
         })
         .collect::<Vec<_>>();
 
@@ -1252,6 +1293,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1367,6 +1409,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1375,6 +1418,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1569,6 +1613,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1577,6 +1622,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -1684,6 +1730,7 @@ mod tests {
                     Some(JoinInfo {
                         outer: false,
                         using: vec![],
+                        lateral: false,
                     }),
                     table_id_counter.next(),
                 )
@@ -1693,6 +1740,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ));
@@ -2380,6 +2428,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),

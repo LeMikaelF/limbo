@@ -25,7 +25,7 @@ use crate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
         result_row::emit_select_result,
-        subquery::emit_non_from_clause_subquery,
+        subquery::{emit_from_clause_subquery, emit_non_from_clause_subquery},
         window::emit_window_loop_source,
     },
     turso_assert,
@@ -625,7 +625,7 @@ fn emit_hash_build_phase(
 pub fn open_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    table_references: &TableReferences,
+    table_references: &mut TableReferences,
     join_order: &[JoinOrderMember],
     predicates: &[WhereTerm],
     temp_cursor_id: Option<CursorID>,
@@ -634,6 +634,25 @@ pub fn open_loop(
 ) -> Result<()> {
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
+
+        // For LATERAL subqueries, emit the coroutine here (after outer tables' cursors are open)
+        // This must be done before we take an immutable reference to the table below.
+        {
+            let table_mut = &mut table_references.joined_tables_mut()[joined_table_index];
+            let table_internal_id = table_mut.internal_id;
+            if let Table::FromClauseSubquery(subq) = &mut table_mut.table {
+                if subq.lateral && subq.result_columns_start_reg.is_none() {
+                    // Emit the LATERAL subquery coroutine now
+                    let result_columns_start =
+                        emit_from_clause_subquery(program, &mut subq.plan, t_ctx)?;
+                    subq.result_columns_start_reg = Some(result_columns_start);
+                    // Register the result columns start register in ProgramBuilder so that
+                    // dependent LATERAL subqueries can look it up.
+                    program.register_subquery_result_reg(table_internal_id, result_columns_start);
+                }
+            }
+        }
+
         let table = &table_references.joined_tables()[joined_table_index];
         let LoopLabels {
             loop_start,
@@ -733,6 +752,8 @@ pub fn open_loop(
                         program.preassign_label_to_next_insn(loop_start);
                     }
                     (Scan::Subquery, Table::FromClauseSubquery(from_clause_subquery)) => {
+                        // For LATERAL subqueries, the coroutine was emitted earlier in this function
+                        // For non-LATERAL subqueries, it was emitted in emit_from_clause_subqueries
                         let (yield_reg, coroutine_implementation_start) =
                             match &from_clause_subquery.plan.query_destination {
                                 QueryDestination::CoroutineYield {

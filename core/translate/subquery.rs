@@ -151,6 +151,11 @@ fn plan_subqueries_with_outer_query_access<'a>(
                 identifier: t.identifier.clone(),
                 internal_id: t.internal_id,
                 col_used_mask: ColumnUsedMask::default(),
+                result_columns_start_reg: if let Table::FromClauseSubquery(subq) = &t.table {
+                    subq.result_columns_start_reg
+                } else {
+                    None
+                },
             })
             .chain(
                 referenced_tables
@@ -161,6 +166,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         identifier: t.identifier.clone(),
                         internal_id: t.internal_id,
                         col_used_mask: ColumnUsedMask::default(),
+                        result_columns_start_reg: t.result_columns_start_reg,
                     }),
             )
             .collect::<Vec<_>>()
@@ -543,6 +549,14 @@ pub fn emit_from_clause_subqueries(
         );
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
+            // Skip LATERAL subqueries here - they are emitted in the main loop
+            // after the outer tables' cursors are opened, so they can reference
+            // columns from those tables.
+            if from_clause_subquery.lateral {
+                program.pop_current_parent_explain();
+                continue;
+            }
+
             // Emit the subquery and get the start register of the result columns.
             let result_columns_start =
                 emit_from_clause_subquery(program, &mut from_clause_subquery.plan, t_ctx)?;

@@ -265,6 +265,7 @@ fn prepare_one_select_plan(
                         table_id: t.internal_id,
                         original_idx: i,
                         is_outer: t.join_info.as_ref().is_some_and(|j| j.outer),
+                        is_lateral: t.join_info.as_ref().is_some_and(|j| j.lateral),
                     })
                     .collect(),
                 table_references,

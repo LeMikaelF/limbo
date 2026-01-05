@@ -293,11 +293,38 @@ fn parse_from_clause_table(
     ctes: &mut Vec<JoinedTable>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    parse_from_clause_table_inner(
+        table,
+        resolver,
+        program,
+        table_references,
+        vtab_predicates,
+        ctes,
+        connection,
+        false, // not lateral
+    )
+}
+
+fn parse_from_clause_table_inner(
+    table: ast::SelectTable,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    vtab_predicates: &mut Vec<Expr>,
+    ctes: &mut Vec<JoinedTable>,
+    connection: &Arc<crate::Connection>,
+    is_lateral: bool,
+) -> Result<()> {
     match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => {
             if indexed.is_some() {
                 crate::bail_parse_error!(
                     "INDEXED BY / NOT INDEXED clauses are not supported yet in FROM clause"
+                );
+            }
+            if is_lateral {
+                crate::bail_parse_error!(
+                    "LATERAL can only be used with subqueries, not table references"
                 );
             }
             parse_table(
@@ -313,16 +340,45 @@ fn parse_from_clause_table(
             )
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
+            // For LATERAL joins, add the already-joined tables as outer query references
+            // so the subquery can reference columns from them
+            let lateral_refs: Vec<OuterQueryReference> = if is_lateral {
+                table_references
+                    .joined_tables()
+                    .iter()
+                    .map(|t| OuterQueryReference {
+                        identifier: t.identifier.clone(),
+                        internal_id: t.internal_id,
+                        table: t.table.clone(),
+                        col_used_mask: ColumnUsedMask::default(),
+                        // For FromClauseSubquery tables, copy the result_columns_start_reg if available
+                        result_columns_start_reg: if let Table::FromClauseSubquery(subq) = &t.table {
+                            subq.result_columns_start_reg
+                        } else {
+                            None
+                        },
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+
             let outer_query_refs_for_subquery = table_references
                 .outer_query_refs()
                 .iter()
                 .cloned()
+                .chain(lateral_refs)
                 .chain(
                     ctes.iter()
                         .cloned()
                         .map(|t: JoinedTable| OuterQueryReference {
                             identifier: t.identifier,
                             internal_id: t.internal_id,
+                            result_columns_start_reg: if let Table::FromClauseSubquery(subq) = &t.table {
+                                subq.result_columns_start_reg
+                            } else {
+                                None
+                            },
                             table: t.table,
                             col_used_mask: ColumnUsedMask::default(),
                         }),
@@ -352,21 +408,39 @@ fn parse_from_clause_table(
                 subplan,
                 None,
                 program.table_reference_counter.next(),
+                is_lateral,
             )?);
             Ok(())
         }
-        ast::SelectTable::TableCall(qualified_name, args, maybe_alias) => parse_table(
-            table_references,
-            resolver,
-            program,
-            ctes,
-            vtab_predicates,
-            &qualified_name,
-            maybe_alias.as_ref(),
-            &args,
-            connection,
-        ),
-        _ => todo!(),
+        ast::SelectTable::TableCall(qualified_name, args, maybe_alias) => {
+            if is_lateral {
+                crate::bail_parse_error!(
+                    "LATERAL can only be used with subqueries, not table-valued functions"
+                );
+            }
+            parse_table(
+                table_references,
+                resolver,
+                program,
+                ctes,
+                vtab_predicates,
+                &qualified_name,
+                maybe_alias.as_ref(),
+                &args,
+                connection,
+            )
+        }
+        ast::SelectTable::Sub(from_clause, maybe_alias) => {
+            // For LATERAL, the Sub (parenthesized FROM clause) needs special handling
+            if is_lateral {
+                crate::bail_parse_error!(
+                    "LATERAL is not supported with parenthesized FROM clauses - use a subquery SELECT instead"
+                );
+            }
+            // Regular sub-FROM clause parsing
+            // Note: This case is rare and currently uses todo!() in the original code
+            todo!("Sub FROM clause parsing for {:?}", (from_clause, maybe_alias))
+        }
     }
 }
 
@@ -696,6 +770,11 @@ pub fn parse_from(
                     internal_id: t.internal_id,
                     table: t.table.clone(),
                     col_used_mask: ColumnUsedMask::default(),
+                    result_columns_start_reg: if let Table::FromClauseSubquery(subq) = &t.table {
+                        subq.result_columns_start_reg
+                    } else {
+                        None
+                    },
                 }
             }));
 
@@ -717,6 +796,7 @@ pub fn parse_from(
                 cte_plan,
                 None,
                 program.table_reference_counter.next(),
+                false, // CTEs are not lateral
             )?);
         }
     }
@@ -1050,17 +1130,8 @@ fn parse_join(
         constraint,
     } = join;
 
-    parse_from_clause_table(
-        table.as_ref().clone(),
-        resolver,
-        program,
-        table_references,
-        vtab_predicates,
-        ctes,
-        connection,
-    )?;
-
-    let (outer, natural) = match join_operator {
+    // Extract join flags BEFORE parsing the table, since LATERAL affects how we parse subqueries
+    let (outer, natural, lateral) = match &join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
             if join_type.contains(JoinType::RIGHT) {
                 crate::bail_parse_error!("RIGHT JOIN is not supported");
@@ -1070,10 +1141,23 @@ fn parse_join(
             }
             let is_outer = join_type.contains(JoinType::OUTER);
             let is_natural = join_type.contains(JoinType::NATURAL);
-            (is_outer, is_natural)
+            let is_lateral = join_type.contains(JoinType::LATERAL);
+            (is_outer, is_natural, is_lateral)
         }
-        _ => (false, false),
+        _ => (false, false, false),
     };
+
+    // Parse the table with LATERAL context if needed
+    parse_from_clause_table_inner(
+        table.as_ref().clone(),
+        resolver,
+        program,
+        table_references,
+        vtab_predicates,
+        ctes,
+        connection,
+        lateral,
+    )?;
 
     if natural && constraint.is_some() {
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
@@ -1249,7 +1333,7 @@ fn parse_join(
         .joined_tables_mut()
         .get_mut(last_idx)
         .unwrap();
-    rightmost_table.join_info = Some(JoinInfo { outer, using });
+    rightmost_table.join_info = Some(JoinInfo { outer, using, lateral });
 
     Ok(())
 }
