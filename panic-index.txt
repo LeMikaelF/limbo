@@ -28,6 +28,30 @@ github-issues/parameter-zero-index-panic.md
 thread 'main' panicked at core/parameters.rs:102:59:
 called `Result::unwrap()` on an `Err` value: ParseIntError { kind: Zero }
 
+github-issues/json-float-parse-panic.md
+thread 'main' panicked at core/json/mod.rs:560:54:
+Should be valid f64: ParseFloatError { kind: Invalid }
+
+github-issues/prepare-comment-only-panic.md
+thread 'main' panicked at core/lib.rs:1383:19:
+Successful parse on nonempty input string should produce a command
+
+github-issues/natural-join-derived-table-panic.md
+thread 'main' panicked at core/translate/planner.rs:1163:51:
+column name is None
+
+github-issues/subquery-correlated-dotted-alias-panic.md
+thread 'main' panicked at core/translate/expr.rs:2349:30:
+Subquery result_columns_start_reg must be set
+
+github-issues/group-by-where-false-cursor-panic.md
+thread 'main' panicked at core/vdbe/mod.rs:567:32:
+cursor id 0 is None
+
+github-issues/replace-empty-args-panic.md
+thread 'main' panicked at core/translate/expr.rs:1874:17:
+index out of bounds: the len is 0 but the index is 0
+
 # === SAFE STATEMENTS ===
 SAFE: core/json/vtab.rs:317 - guarded by is_empty() check on line 310
 SAFE: core/json/vtab.rs:763 - element_lengths always has at least Root element from path parsing
@@ -50,9 +74,41 @@ SAFE: core/vdbe/value.rs:272 - soundex() handles empty strings at line 253-255 b
 SAFE: core/schema.rs:1583 - all column creation paths set name to Some(...); the ROWID_COLUMN with None is only for ephemeral tables never reaching to_sql()
 SAFE: core/translate/plan.rs:448 - guarded by len() != 1 check at line 439 which returns early
 SAFE: core/schema.rs:547 - remove_index() called only via DROP INDEX which validates index existence first; tested 20+ DROP INDEX variations
+SAFE: core/translate/insert.rs:2609 - guarded by init_autoincrement() at line 949-954 which validates sqlite_sequence existence before setting autoincrement_meta
+SAFE: core/translate/order_by.rs:233 - reg_result_cols_start is unconditionally initialized at emitter.rs:980-983 before emit_order_by is called
+SAFE: core/translate/emitter.rs:1187 - DeletePlan is always created with exactly one joined_table (delete.rs:126-136); SQL grammar requires DELETE to target exactly one table
+SAFE: core/functions/datetime.rs:124 - guarded by values.len() == 0 check at line 118; ExactSizeIterator guarantees accurate length
+SAFE: core/vdbe/value.rs:640 - NaN/Infinity values filtered by NonNan::new() at line 618 and range check at line 628-630; tested 30+ variations
+SAFE: core/translate/expr.rs:4307-4308 - blob literal hex parsing; parser lexer validates ASCII hex digits only and even length at lexer.rs:832-882
+SAFE: core/translate/subquery.rs:550 - index_method unwrap; guarded by optimizer check at optimizer/mod.rs:385-387 ensuring only Some values create IndexMethodQuery
+SAFE: core/translate/select.rs:342 - referenced_table unwrap; guarded by is_none() check at line 339-340 with bail_parse_error!
+SAFE: core/translate/upsert.rs:461 - column name unwrap; all BTree table columns always have names set in create_table; ROWID_COLUMN with None is internal only
+SAFE: core/translate/select.rs:518 - parser at parser.rs:2534 creates values as vec![parse_nexpr_list()], guaranteeing non-empty; tested 50+ SQL variations
+SAFE: core/vector/mod.rs:21 - to_text().expect() is safe; value_type() and to_text() both pattern match on same immutable Copy enum ValueRef
+SAFE: core/translate/window.rs:492 - window.name is always assigned before init_window; either from WINDOW clause or synthetically at window.rs:139
+SAFE: core/translate/planner.rs:724 - from.unwrap() guarded by from.is_none() check at line 644 which returns early; from is owned value, not modified between check and unwrap
+SAFE: core/translate/compound_select.rs:120 - left[0] access; parser guarantees compound select builds left vector with at least one element when compounds.is_empty() is false
+SAFE: core/translate/group_by.rs:276 - order_by[0] access guarded by order_by.is_empty() check at line 268; immutable reference cannot change between check and access
+SAFE: core/stats.rs:155 - idx_name.unwrap() guarded by idx_name.is_none() check at line 147 which returns early via Ok(())
+SAFE: core/translate/logical.rs:71 - parts[0] access; contains('.') check ensures dot exists, splitn(2, '.') on string with dot always produces exactly 2 parts
+SAFE: core/translate/order_by.rs:185 - meta_sort.as_ref().unwrap(); init_order_by always called before emit_order_by through consistent code paths
+SAFE: core/translate/emitter.rs:2251 - labels_main_loop.first().unwrap(); UPDATE always has at least one table reference populating labels_main_loop
+SAFE: core/translate/insert.rs:2815 - child_tbl.get_column().unwrap(); FK column existence validated during FK resolution at schema.rs:1198-1201
+SAFE: core/translate/group_by.rs:710 - meta_group_by.as_mut().unwrap(); init_group_by always sets meta_group_by before emit_group_by is called
+SAFE: core/translate/result_row.rs:231 - label_on_limit_reached.unwrap() guarded by is_none() check at line 221 which returns early
+SAFE: core/translate/insert.rs:791 - yield_reg_opt.unwrap() guarded by inserting_multiple_rows invariant; coroutine path always sets yield_reg_opt
+SAFE: core/translate/expr.rs:1003 - func_type.unwrap() guarded by bail_parse_error! at lines 998-1000 which returns early
+SAFE: core/translate/emitter.rs:1930 - temp_cursor_id.unwrap() inside if let Some(ephemeral_plan) block; both derived from same Option
+SAFE: core/translate/window.rs:477 - joined_tables[0] access; window planning atomically adds subquery to table_references before setting plan.window; init_window only called when plan.window is Some
+SAFE: core/translate/insert.rs:2379-2382 - index.columns[0] access guarded by len() == 1 check; parser rejects empty column lists in CREATE INDEX and UNIQUE constraints
+SAFE: core/translate/logical.rs:71-72 - parts[0] and parts[1] access; splitn(2, '.') always produces exactly 2 parts when string contains '.' (verified by contains('.') check)
 
 # === INCONCLUSIVE ===
 INCONCLUSIVE: core/vdbe/execute.rs:9885 - could not trigger via SQL; may require specific MVCC/WAL state machine conditions
 INCONCLUSIVE: core/types.rs:1752 - partial_cmp().unwrap() in Ord impl; NaN values appear to be converted to NULL before reaching this comparison
 INCONCLUSIVE: core/types.rs:2318 - partial_cmp().unwrap() in compare_records_generic; NaN values filtered by NonNan wrapper or converted to NULL
 INCONCLUSIVE: core/storage/pager.rs:531 - read_varint().unwrap() in page reading; requires corrupted page data which cannot be injected via SQL
+INCONCLUSIVE: core/vdbe/likeop.rs:69 - LIKE regex construction with ESCAPE; tested 40+ patterns including metacharacters, Unicode, and surrogate pairs without triggering panic
+INCONCLUSIVE: core/translate/upsert.rs:704 - column lookup in ON CONFLICT DO UPDATE; tested 30+ scenarios with expression indexes, collations, and partial indexes
+INCONCLUSIVE: core/schema.rs:2280 - FK child column lookup; tested 86+ scenarios including rowid aliases, case sensitivity, and special column names
+INCONCLUSIVE: core/schema.rs:699 - automatic index table lookup; requires corrupted database file (writable_schema manipulation) which cannot be created via SQL in turso
