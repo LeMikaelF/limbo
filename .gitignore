@@ -41,7 +41,6 @@ testing/*.log
 .bugbase
 limbostress.log
 simulator.log
-**/*.txt
 profile.json.gz
 simulator-output/
 tests/*.sql

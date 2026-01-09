@@ -1,0 +1,58 @@
+# Panic Index
+# This file tracks panics that have been reproduced, marked safe, or are inconclusive.
+# Format:
+#   PANIC: file.rs:line - error message
+#   SAFE: file.rs:line - reason why it's safe
+#   INCONCLUSIVE: file.rs:line - reason investigation was inconclusive
+
+# === REPRODUCED PANICS ===
+
+thread 'main' panicked at core/uuid.rs:95:64:
+called `Result::unwrap()` on an `Err` value: Error(ByteLength { len: 0 })
+
+thread 'main' panicked at core/functions/datetime.rs:997:36:
+called `Option::unwrap()` on a `None` value
+
+thread 'main' panicked at core/translate/emitter.rs:3361:53:
+called `Result::unwrap()` on an `Err` value: ParseFloatError { kind: Invalid }
+
+github-issues/pragma-query-only-parse-panic.md
+thread 'main' panicked at core/translate/pragma.rs:697:66:
+called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit }
+
+github-issues/cast-missing-type-panic.md
+thread 'main' panicked at core/translate/expr.rs:965:48:
+called `Option::unwrap()` on a `None` value
+
+github-issues/parameter-zero-index-panic.md
+thread 'main' panicked at core/parameters.rs:102:59:
+called `Result::unwrap()` on an `Err` value: ParseIntError { kind: Zero }
+
+# === SAFE STATEMENTS ===
+SAFE: core/json/vtab.rs:317 - guarded by is_empty() check on line 310
+SAFE: core/json/vtab.rs:763 - element_lengths always has at least Root element from path parsing
+SAFE: core/functions/datetime.rs:52 - guarded by values.len() == 0 check on line 48
+SAFE: core/numeric/mod.rs:647 - sign is always 1.0 or -1.0; sign * f64::INFINITY is never NaN
+SAFE: core/translate/plan.rs:1879 - Unevaluated state invariant: plan is always Some when created
+SAFE: core/json/vtab.rs:568 - input validation in convert_dbtype_to_jsonb prevents invalid JSONB
+SAFE: core/translate/values.rs:52 - parser guarantees VALUES always has at least one row; also guarded by emit_query check at emitter.rs:928
+SAFE: core/translate/values.rs:113 - same parser guarantee as values.rs:52
+SAFE: core/translate/values.rs:140 - same parser guarantee as values.rs:52
+SAFE: core/translate/insert.rs:2224 - parser guarantees VALUES always non-empty; debug_assert at parser/src/ast/check.rs:134
+SAFE: core/translate/expr.rs:4465 - emit_returning_results only called from INSERT/UPDATE/DELETE paths which always populate table_references with exactly one table
+SAFE: core/translate/plan.rs:452 - guarded by aggregates.len() != 1 check at line 434 which returns early if not exactly one aggregate
+SAFE: core/translate/emitter.rs:2960 - preserved_old_registers is Some when btree() returns Some; same condition gates both assignment and usage
+SAFE: core/translate/index.rs:891 - guarded by maybe_index.is_none() check at lines 753-762 which returns early error or success
+SAFE: core/translate/fkeys.rs:767 - column existence validated during FK resolution at schema.rs:1198-1201 via ok_or_else()
+SAFE: core/translate/planner.rs:1247 - guarded by left_col.is_none() check at lines 1230-1235 which returns bail_parse_error!
+SAFE: core/schema.rs:2280 - column existence validated during ResolvedFkRef construction; schema is read-only during compilation
+SAFE: core/vdbe/value.rs:272 - soundex() handles empty strings at line 253-255 before reaching the expect()
+SAFE: core/schema.rs:1583 - all column creation paths set name to Some(...); the ROWID_COLUMN with None is only for ephemeral tables never reaching to_sql()
+SAFE: core/translate/plan.rs:448 - guarded by len() != 1 check at line 439 which returns early
+SAFE: core/schema.rs:547 - remove_index() called only via DROP INDEX which validates index existence first; tested 20+ DROP INDEX variations
+
+# === INCONCLUSIVE ===
+INCONCLUSIVE: core/vdbe/execute.rs:9885 - could not trigger via SQL; may require specific MVCC/WAL state machine conditions
+INCONCLUSIVE: core/types.rs:1752 - partial_cmp().unwrap() in Ord impl; NaN values appear to be converted to NULL before reaching this comparison
+INCONCLUSIVE: core/types.rs:2318 - partial_cmp().unwrap() in compare_records_generic; NaN values filtered by NonNan wrapper or converted to NULL
+INCONCLUSIVE: core/storage/pager.rs:531 - read_varint().unwrap() in page reading; requires corrupted page data which cannot be injected via SQL
