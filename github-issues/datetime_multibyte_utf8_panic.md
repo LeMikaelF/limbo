@@ -53,3 +53,4 @@ The function should gracefully handle multi-byte UTF-8 strings, either by:
 1. Using byte indexing consistently (and handling potential invalid UTF-8 boundaries)
 2. Using character count instead of byte length for the bounds check
 3. Using `.get()` with a fallback instead of `.unwrap()`
+<!-- REPORTED -->

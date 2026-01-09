@@ -62,3 +62,4 @@ For reference, SQLite accepts `CAST(x AS)` as valid SQL and treats it as casting
 Either:
 1. **Reject in parser**: Modify `parse_type()` to return an error when called from CAST context and no type is provided
 2. **Handle in translator**: Replace the `unwrap()` with proper handling - either return a parse error or apply NUMERIC affinity (to match SQLite behavior)
+<!-- REPORTED -->

@@ -36,3 +36,4 @@ Because the guard never triggers, the function proceeds to access `&args[0]` at 
 ## Expected Behavior
 
 SQLite returns an error: `wrong number of arguments to function replace()`
+<!-- REPORTED -->

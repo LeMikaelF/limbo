@@ -71,3 +71,4 @@ The `Literal::Numeric` variant can contain valid SQL numeric literals that are n
 | Hexadecimal | `0xFF` | InvalidDigit |
 | Underscore separator | `1_000` | InvalidDigit |
 | Positive overflow | `9223372036854775808` | PosOverflow |
+<!-- REPORTED -->

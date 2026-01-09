@@ -29,3 +29,4 @@ col.name.as_ref().unwrap()
 ```
 
 This unwraps `None` when the column comes from an anonymous derived table expression like `(SELECT 1)` which doesn't have an explicit column name.
+<!-- REPORTED -->

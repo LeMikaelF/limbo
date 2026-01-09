@@ -1,3 +1,5 @@
+[//]: # (TODO improvements to this: modify the script to tag files "REPORTED", and ignore tagged files)
+
 # Hunting unwraps!
 
 This codebase makes extensive use of `unwrap()`, but this makes the code prone to panics. We have already discovered the

@@ -69,3 +69,4 @@ SELECT 1 LIMIT 0xFF
 SELECT 1 LIMIT 10 OFFSET 0x5  -- Would error gracefully at OFFSET
 SELECT 1 LIMIT 0x5 OFFSET 10  -- Panics at LIMIT
 ```
+<!-- REPORTED -->

@@ -63,3 +63,4 @@ This is a denial-of-service vulnerability. An attacker can:
 ## Suggested Fix
 
 Replace the `expect()` with proper error handling that returns NULL or an error for invalid float values, similar to how invalid JSON input is handled elsewhere in the codebase.
+<!-- REPORTED -->

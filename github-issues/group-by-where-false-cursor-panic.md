@@ -35,3 +35,4 @@ Similar queries that also exhibit issues:
 - `SELECT 1 GROUP BY 1` - causes infinite loop (timeout)
 - `SELECT NULL GROUP BY 1` - causes infinite loop (timeout)
 - Views with GROUP BY on literal values - causes infinite loop
+<!-- REPORTED -->

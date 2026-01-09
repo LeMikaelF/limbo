@@ -52,6 +52,14 @@ github-issues/replace-empty-args-panic.md
 thread 'main' panicked at core/translate/expr.rs:1874:17:
 index out of bounds: the len is 0 but the index is 0
 
+github-issues/json-array-hash-operator-panic.md
+thread 'main' panicked at core/json/jsonb.rs:2715:30:
+internal error: entered unreachable code
+
+github-issues/like-regex-size-limit-panic.md
+thread 'main' panicked at core/vdbe/value.rs:1132:10:
+constructed LIKE regex pattern should be valid: CompiledTooBig(10485760)
+
 # === SAFE STATEMENTS ===
 SAFE: core/json/vtab.rs:317 - guarded by is_empty() check on line 310
 SAFE: core/json/vtab.rs:763 - element_lengths always has at least Root element from path parsing
@@ -102,6 +110,9 @@ SAFE: core/translate/emitter.rs:1930 - temp_cursor_id.unwrap() inside if let Som
 SAFE: core/translate/window.rs:477 - joined_tables[0] access; window planning atomically adds subquery to table_references before setting plan.window; init_window only called when plan.window is Some
 SAFE: core/translate/insert.rs:2379-2382 - index.columns[0] access guarded by len() == 1 check; parser rejects empty column lists in CREATE INDEX and UNIQUE constraints
 SAFE: core/translate/logical.rs:71-72 - parts[0] and parts[1] access; splitn(2, '.') always produces exactly 2 parts when string contains '.' (verified by contains('.') check)
+SAFE: core/translate/trigger_exec.rs:603 - updated_column_indices.expect(); all call sites with TriggerEvent::Update always provide Some(&updated_cols); tested 50+ trigger scenarios
+SAFE: core/translate/compound_select.rs:97 - limit_ctx.as_ref().unwrap(); parser requires LIMIT when OFFSET present; limit_ctx always Some when offset is Some
+SAFE: core/translate/expr.rs:717 - lhs.as_ref().unwrap() in IN subquery; SubqueryResult with In type always created with Some(lhs) at subquery.rs:407-412
 
 # === INCONCLUSIVE ===
 INCONCLUSIVE: core/vdbe/execute.rs:9885 - could not trigger via SQL; may require specific MVCC/WAL state machine conditions
@@ -112,3 +123,4 @@ INCONCLUSIVE: core/vdbe/likeop.rs:69 - LIKE regex construction with ESCAPE; test
 INCONCLUSIVE: core/translate/upsert.rs:704 - column lookup in ON CONFLICT DO UPDATE; tested 30+ scenarios with expression indexes, collations, and partial indexes
 INCONCLUSIVE: core/schema.rs:2280 - FK child column lookup; tested 86+ scenarios including rowid aliases, case sensitivity, and special column names
 INCONCLUSIVE: core/schema.rs:699 - automatic index table lookup; requires corrupted database file (writable_schema manipulation) which cannot be created via SQL in turso
+INCONCLUSIVE: core/json/mod.rs:610 - path.pop().expect(); path parsing guarantees at least Root element; navigate_path preserves path length; tested 40+ json_type variations
