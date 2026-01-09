@@ -41,3 +41,4 @@ But `$[#]` is parsed as `ArrayLocator(None)`, which falls through to `unreachabl
 SQLite supports `$[#]` as a way to reference the element at the array length position (i.e., one past the last element), which is useful for appending. The implementation should either:
 1. Support this operator properly (for functions like `json_insert`)
 2. Return an appropriate error message instead of panicking
+<!-- REPORTED -->

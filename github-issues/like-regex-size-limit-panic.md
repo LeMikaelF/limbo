@@ -41,3 +41,4 @@ Instead of panicking, the code should:
 2. Set a reasonable size limit on LIKE patterns to match SQLite's behavior
 
 Note: The sister function `construct_glob_regex` in `core/vdbe/likeop.rs` correctly uses `map_err` to convert regex errors to `LimboError`, so GLOB handles the same patterns gracefully.
+<!-- REPORTED -->
