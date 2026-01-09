@@ -1,4 +1,4 @@
-# GROUP BY with WHERE 0 causes cursor id panic
+# Panic in GROUP BY with WHERE 0
 
 ## Reproducer
 

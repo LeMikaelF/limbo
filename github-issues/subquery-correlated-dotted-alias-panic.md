@@ -1,4 +1,4 @@
-# Panic: Subquery result_columns_start_reg must be set
+# Panic: "Subquery result_columns_start_reg must be set"
 
 ## Summary
 A panic occurs in `core/translate/expr.rs:2349:30` when using a correlated subquery that references a derived table with a dotted alias name.

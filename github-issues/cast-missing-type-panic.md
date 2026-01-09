@@ -1,4 +1,4 @@
-# CAST without type name causes panic
+# Panic when CAST is used without type
 
 ## Summary
 

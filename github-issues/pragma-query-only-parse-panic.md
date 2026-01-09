@@ -1,4 +1,4 @@
-# PRAGMA query_only panics on non-integer numeric literals
+# Panic when PRAGMA query_only is usec with non-integer numeric literals
 
 ## Summary
 

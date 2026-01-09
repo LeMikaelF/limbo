@@ -1,4 +1,4 @@
-# uuid7_timestamp_ms panics on non-16-byte blobs
+# Panic when uuid7_timestamp_ms is given non-16-byte blobs
 
 ## Summary
 

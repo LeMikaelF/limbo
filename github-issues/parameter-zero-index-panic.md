@@ -1,4 +1,4 @@
-# Panic: Zero parameter index (?0) causes ParseIntError panic
+# Panic in SELECT ?0
 
 ## Summary
 

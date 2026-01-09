@@ -1,4 +1,4 @@
-# datetime functions panic on multi-byte UTF-8 characters
+# Panic in datetime functions on multi-byte UTF-8 characters
 
 ## Summary
 

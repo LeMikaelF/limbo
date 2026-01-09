@@ -1,4 +1,4 @@
-# LIMIT clause panics on hexadecimal and underscore numeric literals
+# PANIC when LIMIT clause has hexadecimal and underscore numeric literals
 
 ## Summary
 

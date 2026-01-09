@@ -1,4 +1,4 @@
-# NATURAL JOIN with derived tables causes panic
+# Panic when NATURAL JOIN is used with derived tables
 
 ## Error
 

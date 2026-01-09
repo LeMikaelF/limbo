@@ -1,4 +1,4 @@
-# replace() function panics with empty arguments
+# Panic when replace() function has no arguments
 
 ## Reproducer
 
